@@ -354,8 +354,16 @@ def fetch_cwl():
     return None
 
 def fetch_ruseo():
-    """澄曜API (免费, 100次/分钟, 最新一期)"""
+    """澄曜API (免费, 100次/分钟, 最新一期)
+    注意: 福彩3D每天约20:30开奖, 此前API可能返回旧数据
+    """
     try:
+        # 安全验证: 当天21:00之后才允许采信 (开奖后)
+        now_bj = time.time() + 8 * 3600  # UTC+8
+        tm_bj = time.gmtime(now_bj)
+        today_str = time.strftime('%Y-%m-%d', tm_bj)
+        hour_bj = tm_bj.tm_hour
+        
         url = 'https://api.ruseo.cn/api/lottery?code=fc3d&type=fc3d'
         headers = {'User-Agent': 'python-lottery/1.0'}
         req = urllib.request.Request(url, headers=headers)
@@ -365,6 +373,10 @@ def fetch_ruseo():
             item = raw['data']['data']['list'][0]
             date_str = item['date']
             digits = [int(d) for d in item['winning_numbers']]
+            # 日期必须是今天, 且已过开奖时间(21:00), 否则可能是过期缓存
+            if date_str == today_str and hour_bj < 21:
+                print(f"  ⚠ 澄曜: 今日未到开奖时间(21:00), 忽略缓存数据")
+                return None
             # 期号由调用方基于已有最新期号+1生成
             return [[None, date_str, digits]]
         return None
