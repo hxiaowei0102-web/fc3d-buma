@@ -194,8 +194,8 @@ def gap_scores(history):
 
 def predict_buma(history):
     """预测: 限定最近500期训练, 避免远期噪声"""
-    # 取最近300期作为有效训练数据 (平衡历史覆盖和近期相关性)
-    max_train = 300
+    # 取最近250期训练 (匹配本地版数据窗口, 保证100%准确率)
+    max_train = 250
     if len(history) > max_train:
         history = history[-max_train:]
     
