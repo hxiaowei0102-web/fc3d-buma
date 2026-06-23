@@ -353,6 +353,23 @@ def fetch_cwl():
         except: continue
     return None
 
+def fetch_ruseo():
+    """澄曜API (免费, 100次/分钟, 最新一期)"""
+    try:
+        url = 'https://api.ruseo.cn/api/lottery?code=fc3d&type=fc3d'
+        headers = {'User-Agent': 'python-lottery/1.0'}
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            raw = json.loads(resp.read())
+        if raw.get('code') == 0 and raw['data']['code'] == 200:
+            item = raw['data']['data']['list'][0]
+            date_str = item['date']
+            digits = [int(d) for d in item['winning_numbers']]
+            # 期号由调用方基于已有最新期号+1生成
+            return [[None, date_str, digits]]
+        return None
+    except: return None
+
 def fetch_cache():
     if os.path.exists(CACHE_FILE):
         try:
@@ -398,8 +415,28 @@ def load_data():
                 data.append(rec); existing.add(rec[0]); n += 1
         if n: print(f"  缓存: +{n}期")
     
-    # cwl API (主数据源)
-    cwl_ok = False
+    # 多源获取: 澄曜(主) → cwl(备用) → GitHub(兜底)
+    new_data_ok = False
+    
+    # 源1: 澄曜API (免费, 最新1期)
+    ruseo_data = fetch_ruseo()
+    if ruseo_data:
+        n = 0
+        latest_issue = max(existing) if existing else '0'
+        for rec in ruseo_data:
+            # 澄曜返回None作为期号, 我们根据上一期+1生成
+            issue_num = rec[0]
+            if issue_num is None:
+                issue_num = str(int(latest_issue) + 1)
+            rec[0] = issue_num
+            if rec[0] not in existing:
+                data.append(rec); existing.add(rec[0]); n += 1
+        if n: print(f"  澄曜: +{n}期 ✓")
+        new_data_ok = True
+    else:
+        print(f"  ⚠ 澄曜离线")
+    
+    # 源2: cwl.gov.cn (更多历史)
     cwl_data = fetch_cwl()
     if cwl_data:
         n = 0
@@ -407,16 +444,15 @@ def load_data():
             if rec[0] not in existing:
                 data.append(rec); existing.add(rec[0]); n += 1
         if n: print(f"  cwl: +{n}期 ✓")
-        cwl_ok = True
+        new_data_ok = True
     else:
         print(f"  ⚠ cwl离线!")
     
-    # 降级: cwl失败时从GitHub补充最新缺失期数 (cache为主要备份)
-    if not cwl_ok:
+    # 源3: 降级 - cwl/澄曜都失败时从GitHub补充
+    if not new_data_ok:
         print(f"  🠖 降级: GitHub补充...", end='')
         gh = fetch_github(gh_token)
         if gh:
-            # 只取比现有最新期更新的记录 (补充最近1-2天缺失)
             latest_existing = max(existing) if existing else '0'
             n = 0
             for rec in gh:
@@ -424,7 +460,7 @@ def load_data():
                     data.append(rec); existing.add(rec[0]); n += 1
             if n:
                 print(f" +{n}期 ✓")
-                cwl_ok = True
+                new_data_ok = True
             else:
                 print(f" 0期(已最新)")
         else:
@@ -459,8 +495,8 @@ def load_data():
     save_cache(data)
     
     n = len(data)
-    from_cwl = "cwl+GitHub" if cwl_ok else "缓存+嵌入"
-    print(f"[数据] 共{n}期: {data[0][0]}~{data[-1][0]} (源: {from_cwl})")
+    from_src = "澄曜+cwl" if new_data_ok else "缓存+嵌入"
+    print(f"[数据] 共{n}期: {data[0][0]}~{data[-1][0]} (源: {from_src})")
     return data
 
 # ============================================================
