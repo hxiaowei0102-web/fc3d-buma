@@ -193,12 +193,7 @@ def gap_scores(history):
     return gap
 
 def predict_buma(history):
-    """预测: 限定最近500期训练, 避免远期噪声"""
-    # 取最近250期训练 (匹配本地版数据窗口, 保证100%准确率)
-    max_train = 250
-    if len(history) > max_train:
-        history = history[-max_train:]
-    
+    """预测: 纯净数据(嵌入+cwl+缓存), 与本地版一致"""
     n = len(history)
     knn_s = knn_scores(history, k=15, lookback=6)
     if knn_s is None:
@@ -366,51 +361,50 @@ def save_cache(data):
     except: pass
 
 def load_data():
-    """云端数据: 嵌入+缓存优先(最近215期) → cwl → GitHub(补充历史)"""
+    """云端: 嵌入+cwl+缓存训练, GitHub仅交叉校验"""
     print("[数据] 多源获取...")
     
-    # 基础: 嵌入数据 (最近215期, 最可靠)
     data = list(EMBEDDED)
     existing = {d[0] for d in data}
     print(f"  嵌入: {len(data)}期 ({data[0][0]}~{data[-1][0]})")
     
-    # 尝试加载缓存补充
+    # 缓存补充
     cache = fetch_cache()
     if cache:
-        cache_added = 0
+        n = 0
         for rec in cache:
             if rec[0] not in existing:
-                data.append(rec)
-                existing.add(rec[0])
-                cache_added += 1
-        if cache_added > 0:
-            print(f"  缓存: +{cache_added}期")
+                data.append(rec); existing.add(rec[0]); n += 1
+        if n: print(f"  缓存: +{n}期")
     
-    # 尝试从cwl拉取最新
+    # cwl API
     cwl_data = fetch_cwl()
     if cwl_data:
-        cwl_added = 0
+        n = 0
         for rec in cwl_data:
             if rec[0] not in existing:
-                data.append(rec)
-                existing.add(rec[0])
-                cwl_added += 1
-        if cwl_added > 0:
-            print(f"  cwl: +{cwl_added}期")
-    
-    # GitHub作为历史补充(只取2023年后, 避免旧数据噪声)
-    github_data = fetch_github()
-    if github_data:
-        gh_added = 0
-        for rec in github_data:
-            if rec[0] >= '2023001' and rec[0] not in existing:
-                data.append(rec)
-                existing.add(rec[0])
-                gh_added += 1
-        if gh_added > 0:
-            print(f"  GitHub: +{gh_added}期 (仅2023+)")
+                data.append(rec); existing.add(rec[0]); n += 1
+        if n: print(f"  cwl: +{n}期")
     
     data.sort(key=lambda x: x[0])
+    
+    # GitHub: 仅交叉校验
+    print(f"  🠖 交叉校验...", end='')
+    gh = fetch_github()
+    if gh:
+        gh_map = {r[0]: tuple(r[2]) for r in gh}
+        checked = mismatch = 0
+        for rec in data:
+            if rec[0] in gh_map:
+                checked += 1
+                if tuple(rec[2]) != gh_map[rec[0]]: mismatch += 1
+        if checked > 0:
+            if mismatch == 0: print(f" GitHub {checked}期一致 ✓")
+            else: print(f" ⚠ GitHub {mismatch}/{checked}期不一致!")
+        else: print(f" 无重叠期")
+    else:
+        print(f" GitHub离线")
+    
     save_cache(data)
     print(f"[数据] 共{len(data)}期: {data[0][0]}~{data[-1][0]}")
     return data
