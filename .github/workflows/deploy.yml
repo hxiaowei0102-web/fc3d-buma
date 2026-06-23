@@ -1,9 +1,13 @@
-name: 每日自动更新两码不组预测
+name: 每日自动更新两码不组预测 (三重备份)
 
 on:
   schedule:
     # 北京时间 22:00 = UTC 14:00
     - cron: '0 14 * * *'
+    # 北京时间 23:30 = UTC 15:30 (备份)
+    - cron: '30 15 * * *'
+    # 北京时间 01:00 = UTC 17:00 (二次备份)
+    - cron: '0 17 * * *'
   workflow_dispatch:  # 允许手动触发
 
 jobs:
@@ -21,15 +25,28 @@ jobs:
         with:
           python-version: '3.11'
       
+      - name: 检查是否需要更新
+        id: check
+        run: |
+          TODAY=$(TZ='Asia/Shanghai' date +'%Y-%m-%d')
+          if git log -1 --pretty=format:"%s" | grep -q "$TODAY"; then
+            echo "skipped=true" >> $GITHUB_OUTPUT
+            echo "今日已更新, 跳过"
+          else
+            echo "skipped=false" >> $GITHUB_OUTPUT
+          fi
+      
       - name: 运行预测算法
+        if: steps.check.outputs.skipped != 'true'
         run: |
           cd docs
           python fc3d_buma.py
       
       - name: 提交更新
+        if: steps.check.outputs.skipped != 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add docs/index.html docs/fc3d_cache.json
-          git diff --staged --quiet || git commit -m "🤖 自动更新 $(date +'%Y-%m-%d')"
+          git diff --staged --quiet || git commit -m "🤖 自动更新 $(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M')"
           git push
