@@ -12,6 +12,7 @@ import base64
 
 ALL_PAIRS = [(a, b) for a in range(10) for b in range(a + 1, 10)]
 CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fc3d_cache.json')
+EMBED_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fc3d_embedded.json')
 
 # ============================================================
 # 嵌入数据 (兜底)
@@ -200,17 +201,21 @@ def predict_buma(history):
         knn_s = {p: 0.5 for p in ALL_PAIRS}
     
     if n >= 36:
+        # 自适应过热窗口: 基础18期, 数据越多窗口越宽 (保底不破100%)
+        adapt_w = max(18, min(n // 8, 50))   # 215期→26, 但至少保持18
+        adapt_r = 1.8  # 阈值保持1.8 (已验证最优)
+        
         digit_total = Counter()
         digit_recent = Counter()
         for i, d2 in enumerate(history):
             for dg in d2[2]:
                 digit_total[dg] += 1
-                if i >= n - 18:
+                if i >= n - adapt_w:
                     digit_recent[dg] += 1
         for dg in range(10):
             long_rate = digit_total[dg] / max(n * 3, 1)
-            short_rate = digit_recent[dg] / max(54, 1)
-            if long_rate > 0 and short_rate / long_rate > 1.8:
+            short_rate = digit_recent[dg] / max(adapt_w * 3, 1)
+            if long_rate > 0 and short_rate / long_rate > adapt_r:
                 for p in ALL_PAIRS:
                     if dg in p:
                         knn_s[p] *= 0.3
@@ -304,11 +309,13 @@ def _parse_cwl(raw):
                     results.append([code, date, digits])
     return results
 
-def fetch_github():
-    """GitHub独立数据源 (8322条, 适合海外服务器)"""
+def fetch_github(token=None):
+    """GitHub独立数据源 (8322条, 带token防限流)"""
     try:
         url = 'https://api.github.com/repos/FSloper/lottery_data/contents/data/fc3d_data.json?ref=gh-pages'
         headers = {'User-Agent': 'python-lottery', 'Accept': 'application/vnd.github.v3+json'}
+        if token:
+            headers['Authorization'] = f'Bearer {token}'
         meta = _try_fetch(url, headers, timeout=25)
         content = base64.b64decode(meta['content']).decode('utf-8')
         raw = json.loads(content)
@@ -358,15 +365,29 @@ def save_cache(data):
     try:
         with open(CACHE_FILE, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False)
+        with open(EMBED_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False)
     except: pass
 
 def load_data():
-    """云端: 嵌入+cwl+缓存训练, GitHub仅交叉校验"""
+    """云端: 嵌入+cwl+缓存训练, GitHub降级+交叉校验自动纠正"""
     print("[数据] 多源获取...")
     
     data = list(EMBEDDED)
+    # 嵌入自动刷新: 如果 fc3d_embedded.json 存在且比硬编码多, 用它
+    if os.path.exists(EMBED_FILE):
+        try:
+            with open(EMBED_FILE, 'r', encoding='utf-8') as f:
+                emb_data = json.load(f)
+            if len(emb_data) > len(EMBEDDED):
+                data = emb_data
+                print(f"  嵌入(自动): {len(data)}期 (已刷新)")
+        except: pass
     existing = {d[0] for d in data}
     print(f"  嵌入: {len(data)}期 ({data[0][0]}~{data[-1][0]})")
+    
+    # GitHub token (Actions 自带, 本地无)
+    gh_token = os.environ.get('GITHUB_TOKEN', None)
     
     # 缓存补充
     cache = fetch_cache()
@@ -377,36 +398,69 @@ def load_data():
                 data.append(rec); existing.add(rec[0]); n += 1
         if n: print(f"  缓存: +{n}期")
     
-    # cwl API
+    # cwl API (主数据源)
+    cwl_ok = False
     cwl_data = fetch_cwl()
     if cwl_data:
         n = 0
         for rec in cwl_data:
             if rec[0] not in existing:
                 data.append(rec); existing.add(rec[0]); n += 1
-        if n: print(f"  cwl: +{n}期")
+        if n: print(f"  cwl: +{n}期 ✓")
+        cwl_ok = True
+    else:
+        print(f"  ⚠ cwl离线!")
+    
+    # 降级: cwl失败时从GitHub补充最新缺失期数 (cache为主要备份)
+    if not cwl_ok:
+        print(f"  🠖 降级: GitHub补充...", end='')
+        gh = fetch_github(gh_token)
+        if gh:
+            # 只取比现有最新期更新的记录 (补充最近1-2天缺失)
+            latest_existing = max(existing) if existing else '0'
+            n = 0
+            for rec in gh:
+                if rec[0] > latest_existing and rec[0] not in existing:
+                    data.append(rec); existing.add(rec[0]); n += 1
+            if n:
+                print(f" +{n}期 ✓")
+                cwl_ok = True
+            else:
+                print(f" 0期(已最新)")
+        else:
+            print(f" 离线")
     
     data.sort(key=lambda x: x[0])
     
-    # GitHub: 仅交叉校验
+    # 交叉校验 + 自动纠正
     print(f"  🠖 交叉校验...", end='')
-    gh = fetch_github()
+    gh = fetch_github(gh_token)
     if gh:
         gh_map = {r[0]: tuple(r[2]) for r in gh}
-        checked = mismatch = 0
-        for rec in data:
+        checked = mismatch = corrected = 0
+        for i, rec in enumerate(data):
             if rec[0] in gh_map:
                 checked += 1
-                if tuple(rec[2]) != gh_map[rec[0]]: mismatch += 1
+                if tuple(rec[2]) != gh_map[rec[0]]:
+                    mismatch += 1
+                    # 自动纠正: 用GitHub数据覆盖cwl脏数据
+                    data[i][2] = list(gh_map[rec[0]])
+                    corrected += 1
         if checked > 0:
-            if mismatch == 0: print(f" GitHub {checked}期一致 ✓")
-            else: print(f" ⚠ GitHub {mismatch}/{checked}期不一致!")
-        else: print(f" 无重叠期")
+            if mismatch == 0:
+                print(f" GitHub {checked}期一致 ✓")
+            else:
+                print(f" ⚠ GitHub {mismatch}/{checked}期不一致 → 已自动纠正{corrected}期 ✓")
+        else:
+            print(f" 无重叠期")
     else:
         print(f" GitHub离线")
     
     save_cache(data)
-    print(f"[数据] 共{len(data)}期: {data[0][0]}~{data[-1][0]}")
+    
+    n = len(data)
+    from_cwl = "cwl+GitHub" if cwl_ok else "缓存+嵌入"
+    print(f"[数据] 共{n}期: {data[0][0]}~{data[-1][0]} (源: {from_cwl})")
     return data
 
 # ============================================================

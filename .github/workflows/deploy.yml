@@ -44,9 +44,35 @@ jobs:
       
       - name: 提交更新
         if: steps.check.outputs.skipped != 'true'
+        id: commit
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add docs/index.html docs/fc3d_cache.json
-          git diff --staged --quiet || git commit -m "🤖 自动更新 $(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M')"
-          git push
+          git add docs/index.html docs/fc3d_cache.json docs/fc3d_embedded.json
+          if git diff --staged --quiet; then
+            echo "无变更"
+            exit 0
+          fi
+          git commit -m "🤖 自动更新 $(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M')"
+          # 重试3次push, 每次先pull --rebase防冲突
+          for i in 1 2 3; do
+            if git pull --rebase origin master 2>/dev/null && git push; then
+              echo "push_ok=true" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            echo "push失败, 第${i}次重试..."
+            sleep $(($i * 5))
+          done
+          echo "push_ok=false" >> $GITHUB_OUTPUT
+          echo "::error::git push 连续3次失败"
+          exit 1
+
+      - name: 失败通知
+        if: failure() && steps.check.outputs.skipped != 'true'
+        run: |
+          gh issue create \
+            --title "⚠ Workflow 失败 $(TZ='Asia/Shanghai' date +'%m-%d %H:%M')" \
+            --body "自动更新失败，请检查 [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" \
+            --label "bug" 2>/dev/null || echo "Issue创建失败(可能已有通知)"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

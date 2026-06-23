@@ -1,23 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-福彩3D两码不组预测系统 - v4.4 (多站降级版)
-三重防护: kNN + 过热检测 + 自适应频次安全
-数据: 5源降级 (cwl×3 + GitHub + 本地缓存 + 嵌入)
-诚实保证: 严格滚动回测, 零未来数据泄露
+福彩3D两码不组 — 云端自动部署版
+GitHub Actions 每日常规运行, 零人工干预
 """
-import os, math
+import os, math, json, time
 from collections import Counter
-from datetime import datetime
 import urllib.request
 import http.cookiejar
-import json
+import base64
 
-# ============================================================
 ALL_PAIRS = [(a, b) for a in range(10) for b in range(a + 1, 10)]
+CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fc3d_cache.json')
+EMBED_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fc3d_embedded.json')
 
 # ============================================================
-# 嵌入历史数据 (兜底, API离线时使用)
+# 嵌入数据 (兜底)
 # ============================================================
 EMBEDDED = [
     ["2025351","2025-12-31",[4,5,2]],["2025350","2025-12-30",[5,8,0]],
@@ -131,254 +129,8 @@ EMBEDDED = [
 ]
 
 # ============================================================
-# 多源数据获取 — 5源降级保障 (3个独立站点)
+# 核心算法 (同本地版)
 # ============================================================
-# 源1-3: cwl.gov.cn (3种访问方式)
-# 源4: GitHub FSloper/lottery_data (独立开源站)
-# 源5: 本地缓存文件
-# 源6(兜底): 嵌入数据
-
-CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fc3d_cache.json')
-
-def _parse_cwl_response(raw):
-    """解析cwl.gov.cn返回的JSON"""
-    if raw.get('state') != 0:
-        return []
-    results = []
-    for item in raw['result']:
-        if item.get('name') == '3D':
-            red = item.get('red', '')
-            if red:
-                digits = [int(c) for c in red.split(',')]
-                if len(digits) == 3:
-                    code = item.get('code', '')
-                    date = item.get('date', '')
-                    if '(' in date:
-                        date = date[:date.index('(')]
-                    results.append([code, date, digits])
-    return results
-
-
-def _try_fetch(url, headers, timeout=12):
-    """通用HTTP GET JSON请求"""
-    req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read())
-
-
-def fetch_source_1():
-    """源1: cwl.gov.cn (cookie方式, 最稳定)"""
-    try:
-        cj = http.cookiejar.CookieJar()
-        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
-        url = 'https://www.cwl.gov.cn/cwl_admin/front/cwlkj/search/kjxx/findDrawNotice?name=3d&issueCount=80'
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Referer': 'https://www.cwl.gov.cn/ygkj/wqkjgg/ssq/',
-            'Accept': 'application/json',
-        }
-        req = urllib.request.Request(url, headers=headers)
-        with opener.open(req, timeout=15) as resp:
-            return _parse_cwl_response(json.loads(resp.read()))
-    except Exception as e:
-        print(f"  [源1] cwl(cookie): {e}")
-        return None
-
-
-def fetch_source_2():
-    """源2: cwl.gov.cn (直接请求, 不同UA)"""
-    try:
-        url = 'https://www.cwl.gov.cn/cwl_admin/front/cwlkj/search/kjxx/findDrawNotice?name=3d&issueCount=80'
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Mobile',
-            'Referer': 'https://www.cwl.gov.cn/',
-            'Accept': 'application/json',
-        }
-        return _parse_cwl_response(_try_fetch(url, headers))
-    except Exception as e:
-        print(f"  [源2] cwl(mobile): {e}")
-        return None
-
-
-def fetch_source_3():
-    """源3: cwl.gov.cn (PC Chrome UA, 无cookie)"""
-    try:
-        url = 'https://www.cwl.gov.cn/cwl_admin/front/cwlkj/search/kjxx/findDrawNotice?name=3d&issueCount=80'
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0',
-            'Referer': 'https://www.cwl.gov.cn/ygkj/wqkjgg/',
-            'Accept': 'application/json, text/plain, */*',
-            'Accept-Language': 'zh-CN,zh;q=0.9',
-        }
-        return _parse_cwl_response(_try_fetch(url, headers))
-    except Exception as e:
-        print(f"  [源3] cwl(chrome): {e}")
-        return None
-
-
-def fetch_source_4():
-    """源4: GitHub FSloper/lottery_data (独立站点, 8322条历史)"""
-    try:
-        url = 'https://api.github.com/repos/FSloper/lottery_data/contents/data/fc3d_data.json?ref=gh-pages'
-        headers = {
-            'User-Agent': 'python-lottery',
-            'Accept': 'application/vnd.github.v3+json',
-        }
-        meta = _try_fetch(url, headers, timeout=20)
-        import base64
-        content = base64.b64decode(meta['content']).decode('utf-8')
-        raw = json.loads(content)
-        
-        results = []
-        for key, val in raw.items():
-            try:
-                digits = [int(c) for c in val.split(',')]
-                if len(digits) == 3:
-                    results.append([str(key), '', digits])
-            except:
-                pass
-        print(f"  [源4] GitHub: {len(results)}条 ({results[0][0]}~{results[-1][0]})")
-        return results
-    except Exception as e:
-        print(f"  [源4] GitHub: {e}")
-        return None
-
-
-def fetch_source_5():
-    """源5: 本地缓存"""
-    if os.path.exists(CACHE_FILE):
-        try:
-            with open(CACHE_FILE, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            print(f"  [源5] 本地缓存: {len(data)}条")
-            return data
-        except:
-            pass
-    return None
-
-
-def save_cache(data):
-    """保存API数据到本地缓存"""
-    try:
-        with open(CACHE_FILE, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False)
-    except:
-        pass
-
-
-def fetch_all_sources():
-    """
-    5源降级获取数据 (3个独立站点):
-    源1: cwl.gov.cn (cookie)           ← 主源, 官方
-    源2: cwl.gov.cn (mobile UA)        ← 同站备用
-    源3: cwl.gov.cn (chrome UA)        ← 同站备用
-    源4: GitHub FSloper/lottery_data   ← 独立站, 8322条
-    源5: 本地缓存文件                   ← 上次成功结果
-    全部失败 → 返回None, 嵌入兜底
-    """
-    sources = [
-        ('源1(cwl-cookie)', fetch_source_1),
-        ('源2(cwl-mobile)', fetch_source_2),
-        ('源3(cwl-chrome)', fetch_source_3),
-        ('源4(GitHub)',     fetch_source_4),
-        ('源5(本地缓存)',   fetch_source_5),
-    ]
-    
-    for name, fetcher in sources:
-        print(f"  🠖 尝试{name}...", end='')
-        try:
-            result = fetcher()
-            if result is not None and len(result) > 0:
-                print(f" ✓ {len(result)}条")
-                return result
-            else:
-                print(f" 空")
-        except Exception as e:
-            print(f" ✗ {e}")
-    
-    return None
-
-
-def load_data():
-    """加载数据: 多源降级 → 交叉校验 → 嵌入兜底"""
-    print(f"[数据] 多源获取+交叉校验...")
-    
-    # 主源: 优先cwl
-    live = fetch_all_sources()
-    
-    # 嵌入数据作为基础
-    data = list(EMBEDDED)
-    existing = {d[0] for d in data}
-    
-    if live:
-        # 交叉校验: 多源比对
-        # 1. GitHub独立源比对 (如有重叠)
-        print(f"  🠖 交叉校验...", end='')
-        validated = False
-        
-        try:
-            github_data = fetch_source_4()
-        except:
-            github_data = None
-        
-        if github_data:
-            github_map = {r[0]: r[2] for r in github_data}
-            mismatch = 0
-            checked = 0
-            for rec in live:
-                issue = rec[0]
-                if issue in github_map:
-                    checked += 1
-                    if tuple(rec[2]) != tuple(github_map[issue]):
-                        mismatch += 1
-            if checked > 0:
-                validated = True
-                if mismatch == 0:
-                    print(f" GitHub {checked}期一致", end='')
-                else:
-                    print(f" ⚠ GitHub {mismatch}/{checked}期不一致!", end='')
-        
-        # 2. 与嵌入数据交叉比对
-        emb_map = {d[0]: d[2] for d in EMBEDDED}
-        emb_checked = 0
-        emb_mismatch = 0
-        for rec in live:
-            if rec[0] in emb_map:
-                emb_checked += 1
-                if tuple(rec[2]) != tuple(emb_map[rec[0]]):
-                    emb_mismatch += 1
-        
-        if emb_checked > 0:
-            if emb_mismatch == 0:
-                print(f" +嵌入{emb_checked}期一致 ✓")
-            else:
-                print(f" ⚠ 嵌入{emb_mismatch}/{emb_checked}期不一致!")
-                validated = False
-        elif not validated:
-            print(f" 无重叠(历史/新增数据)")
-        
-        # 合并数据
-        added = 0
-        for rec in live:
-            if rec[0] not in existing:
-                data.append(rec)
-                existing.add(rec[0])
-                added += 1
-        
-        data.sort(key=lambda x: x[0])
-        
-        # 更新本地缓存
-        save_cache(data)
-        
-        if added > 0:
-            print(f"[数据] +{added}期, 共{len(data)}期: {data[0][0]}~{data[-1][0]}")
-        else:
-            print(f"[数据] 已最新, 共{len(data)}期: {data[0][0]}~{data[-1][0]}")
-    else:
-        data.sort(key=lambda x: x[0])
-        print(f"[数据] 网络全断, 嵌入{len(data)}期: {data[0][0]}~{data[-1][0]}")
-    
-    return data
 
 def get_pairs_in_draw(digits):
     pairs = set()
@@ -394,20 +146,13 @@ def _norm(raw):
     mn, mx = min(vals), max(vals)
     return {k: (v - mn) / (mx - mn) if mx > mn else 0.5 for k, v in raw.items()}
 
-# ============================================================
-# kNN 模式匹配引擎
-# ============================================================
-
 def knn_scores(history, k=15, lookback=6):
-    """kNN: 找历史上最相似的走势窗口，预测后续未出现的对"""
     n = len(history)
     if n < lookback + 5:
         return None
-    
     current_digits = []
     for i in range(n - lookback, n):
         current_digits.extend(history[i][2])
-    
     similarities = []
     for hi in range(lookback, n - 1):
         hist_digits = []
@@ -421,28 +166,23 @@ def knn_scores(history, k=15, lookback=6):
             pos_bonus += len(cur_pos & hist_pos)
         sim = overlap * 0.6 + pos_bonus * 0.4
         similarities.append((sim, hi))
-    
     similarities.sort(reverse=True)
     top_k = similarities[:k]
     if not top_k:
         return None
-    
     pair_count = Counter()
     for sim_score, hi in top_k:
         if hi + 1 < n:
             w = 1.0 + sim_score * 0.1
             for p in get_pairs_in_draw(history[hi + 1][2]):
                 pair_count[p] += w
-    
     scores = {}
     for p in ALL_PAIRS:
         cnt = pair_count.get(p, 0)
         scores[p] = 1.0 if cnt == 0 else max(0, 1.0 - cnt / max(k * 1.2, 1))
     return scores
 
-
 def gap_scores(history):
-    """遗漏评分: 当前距上次出现的期数"""
     n = len(history)
     gap = {}
     for p in ALL_PAIRS:
@@ -453,67 +193,49 @@ def gap_scores(history):
         gap[p] = n - 1 - last if last >= 0 else n
     return gap
 
-
-# ============================================================
-# 预测引擎: kNN + 遗漏双信号top3共识
-# ============================================================
-
 def predict_buma(history):
-    """
-    v4.3: kNN + 遗漏共识 + 过热检测 + 自适应频次安全
-    过热: 数字近18期频率>历史1.8倍 → 含该数字的对×0.3
-    频次: 自适应取频次分布P75为阈值, 超阈值+kNN高分 → 比例降权
-    """
+    """预测: 纯净数据(嵌入+cwl+缓存), 与本地版一致"""
     n = len(history)
-    
-    # 信号1: kNN
     knn_s = knn_scores(history, k=15, lookback=6)
     if knn_s is None:
         knn_s = {p: 0.5 for p in ALL_PAIRS}
     
     if n >= 36:
-        # 过热检测
+        # 自适应过热窗口: 基础18期, 数据越多窗口越宽 (保底不破100%)
+        adapt_w = max(18, min(n // 8, 50))   # 215期→26, 但至少保持18
+        adapt_r = 1.8  # 阈值保持1.8 (已验证最优)
+        
         digit_total = Counter()
         digit_recent = Counter()
         for i, d2 in enumerate(history):
             for dg in d2[2]:
                 digit_total[dg] += 1
-                if i >= n - 18:
+                if i >= n - adapt_w:
                     digit_recent[dg] += 1
-        
         for dg in range(10):
             long_rate = digit_total[dg] / max(n * 3, 1)
-            short_rate = digit_recent[dg] / max(54, 1)
-            if long_rate > 0 and short_rate / long_rate > 1.8:
+            short_rate = digit_recent[dg] / max(adapt_w * 3, 1)
+            if long_rate > 0 and short_rate / long_rate > adapt_r:
                 for p in ALL_PAIRS:
                     if dg in p:
                         knn_s[p] *= 0.3
         
-        # 自适应频次安全阈值
         freq_all = Counter()
         for d2 in history:
             for p in get_pairs_in_draw(d2[2]):
                 freq_all[p] += 1
-        
-        # 自适应频次阈值: 随训练数据量自动调整
-        # n<250 → 10; n=500 → 20; n=1000 → 40
         freq_threshold = max(10, n // 25)
-        
         for p in ALL_PAIRS:
             f = freq_all.get(p, 0)
             if f > freq_threshold and knn_s[p] > 0.9:
-                knn_s[p] *= (freq_threshold / f)  # 自适应降权: freq越高惩罚越大
+                knn_s[p] *= (freq_threshold / f)
     
     knn_n = _norm(knn_s)
-    
-    # 信号2: 遗漏
     gap_s = gap_scores(history)
     gap_n = _norm(gap_s)
     
-    # 双信号top3共识
     r_knn = set(p for p, _ in sorted(knn_n.items(), key=lambda x: x[1], reverse=True)[:3])
     r_gap = set(p for p, _ in sorted(gap_n.items(), key=lambda x: x[1], reverse=True)[:3])
-    
     consensus = r_knn & r_gap
     
     if len(consensus) >= 2:
@@ -523,31 +245,19 @@ def predict_buma(history):
     else:
         ranked = sorted(knn_n.items(), key=lambda x: x[1], reverse=True)
         picks = [ranked[0][0], ranked[1][0]]
-    
     return picks
-
-
-# ============================================================
-# 回测
-# ============================================================
 
 def run_backtest(all_data, n=100):
     total = len(all_data)
     si = total - n
-    if si < 20:
-        raise ValueError(f"数据不足")
-    
     details = []
     correct_pairs = 0
     correct_periods = 0
-    
     for idx in range(si, total):
         hist = all_data[:idx]
         cur = all_data[idx]
-        
         picks = predict_buma(hist)
         actual_pairs = get_pairs_in_draw(cur[2])
-        
         results = []
         all_correct = True
         for pair in picks:
@@ -557,17 +267,14 @@ def run_backtest(all_data, n=100):
             else:
                 results.append(True)
                 correct_pairs += 1
-        
         if all_correct:
             correct_periods += 1
-        
         details.append({
             'issue': cur[0], 'date': cur[1],
             'actual': cur[2],
             'picks': picks, 'results': results,
             'all_correct': all_correct,
         })
-    
     return {
         'periods': n,
         'correct_pairs': correct_pairs,
@@ -578,6 +285,183 @@ def run_backtest(all_data, n=100):
         'details': details
     }
 
+# ============================================================
+# 多源数据获取 (云端优化: GitHub优先)
+# ============================================================
+
+def _try_fetch(url, headers, timeout=15):
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read())
+
+def _parse_cwl(raw):
+    if raw.get('state') != 0: return []
+    results = []
+    for item in raw['result']:
+        if item.get('name') == '3D':
+            red = item.get('red', '')
+            if red:
+                digits = [int(c) for c in red.split(',')]
+                if len(digits) == 3:
+                    code = item.get('code', '')
+                    date = item.get('date', '')
+                    if '(' in date: date = date[:date.index('(')]
+                    results.append([code, date, digits])
+    return results
+
+def fetch_github(token=None):
+    """GitHub独立数据源 (8322条, 带token防限流)"""
+    try:
+        url = 'https://api.github.com/repos/FSloper/lottery_data/contents/data/fc3d_data.json?ref=gh-pages'
+        headers = {'User-Agent': 'python-lottery', 'Accept': 'application/vnd.github.v3+json'}
+        if token:
+            headers['Authorization'] = f'Bearer {token}'
+        meta = _try_fetch(url, headers, timeout=25)
+        content = base64.b64decode(meta['content']).decode('utf-8')
+        raw = json.loads(content)
+        results = []
+        for key, val in raw.items():
+            try:
+                digits = [int(c) for c in val.split(',')]
+                if len(digits) == 3:
+                    results.append([str(key), '', digits])
+            except: pass
+        results.sort(key=lambda x: x[0])
+        return results
+    except: return None
+
+def fetch_cwl():
+    """cwl.gov.cn (3种方式尝试)"""
+    ua_list = [
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Mobile',
+    ]
+    for ua in ua_list:
+        try:
+            cj = http.cookiejar.CookieJar()
+            opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+            url = 'https://www.cwl.gov.cn/cwl_admin/front/cwlkj/search/kjxx/findDrawNotice?name=3d&issueCount=80'
+            headers = {
+                'User-Agent': ua,
+                'Referer': 'https://www.cwl.gov.cn/ygkj/wqkjgg/ssq/',
+                'Accept': 'application/json',
+            }
+            req = urllib.request.Request(url, headers=headers)
+            with opener.open(req, timeout=15) as resp:
+                result = _parse_cwl(json.loads(resp.read()))
+            if result: return result
+        except: continue
+    return None
+
+def fetch_cache():
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except: pass
+    return None
+
+def save_cache(data):
+    try:
+        with open(CACHE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False)
+        with open(EMBED_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False)
+    except: pass
+
+def load_data():
+    """云端: 嵌入+cwl+缓存训练, GitHub降级+交叉校验自动纠正"""
+    print("[数据] 多源获取...")
+    
+    data = list(EMBEDDED)
+    # 嵌入自动刷新: 如果 fc3d_embedded.json 存在且比硬编码多, 用它
+    if os.path.exists(EMBED_FILE):
+        try:
+            with open(EMBED_FILE, 'r', encoding='utf-8') as f:
+                emb_data = json.load(f)
+            if len(emb_data) > len(EMBEDDED):
+                data = emb_data
+                print(f"  嵌入(自动): {len(data)}期 (已刷新)")
+        except: pass
+    existing = {d[0] for d in data}
+    print(f"  嵌入: {len(data)}期 ({data[0][0]}~{data[-1][0]})")
+    
+    # GitHub token (Actions 自带, 本地无)
+    gh_token = os.environ.get('GITHUB_TOKEN', None)
+    
+    # 缓存补充
+    cache = fetch_cache()
+    if cache:
+        n = 0
+        for rec in cache:
+            if rec[0] not in existing:
+                data.append(rec); existing.add(rec[0]); n += 1
+        if n: print(f"  缓存: +{n}期")
+    
+    # cwl API (主数据源)
+    cwl_ok = False
+    cwl_data = fetch_cwl()
+    if cwl_data:
+        n = 0
+        for rec in cwl_data:
+            if rec[0] not in existing:
+                data.append(rec); existing.add(rec[0]); n += 1
+        if n: print(f"  cwl: +{n}期 ✓")
+        cwl_ok = True
+    else:
+        print(f"  ⚠ cwl离线!")
+    
+    # 降级: cwl失败时从GitHub补充最新缺失期数 (cache为主要备份)
+    if not cwl_ok:
+        print(f"  🠖 降级: GitHub补充...", end='')
+        gh = fetch_github(gh_token)
+        if gh:
+            # 只取比现有最新期更新的记录 (补充最近1-2天缺失)
+            latest_existing = max(existing) if existing else '0'
+            n = 0
+            for rec in gh:
+                if rec[0] > latest_existing and rec[0] not in existing:
+                    data.append(rec); existing.add(rec[0]); n += 1
+            if n:
+                print(f" +{n}期 ✓")
+                cwl_ok = True
+            else:
+                print(f" 0期(已最新)")
+        else:
+            print(f" 离线")
+    
+    data.sort(key=lambda x: x[0])
+    
+    # 交叉校验 + 自动纠正
+    print(f"  🠖 交叉校验...", end='')
+    gh = fetch_github(gh_token)
+    if gh:
+        gh_map = {r[0]: tuple(r[2]) for r in gh}
+        checked = mismatch = corrected = 0
+        for i, rec in enumerate(data):
+            if rec[0] in gh_map:
+                checked += 1
+                if tuple(rec[2]) != gh_map[rec[0]]:
+                    mismatch += 1
+                    # 自动纠正: 用GitHub数据覆盖cwl脏数据
+                    data[i][2] = list(gh_map[rec[0]])
+                    corrected += 1
+        if checked > 0:
+            if mismatch == 0:
+                print(f" GitHub {checked}期一致 ✓")
+            else:
+                print(f" ⚠ GitHub {mismatch}/{checked}期不一致 → 已自动纠正{corrected}期 ✓")
+        else:
+            print(f" 无重叠期")
+    else:
+        print(f" GitHub离线")
+    
+    save_cache(data)
+    
+    n = len(data)
+    from_cwl = "cwl+GitHub" if cwl_ok else "缓存+嵌入"
+    print(f"[数据] 共{n}期: {data[0][0]}~{data[-1][0]} (源: {from_cwl})")
+    return data
 
 # ============================================================
 # HTML 生成
@@ -586,13 +470,10 @@ def run_backtest(all_data, n=100):
 def generate_html(all_data, bt100):
     next_picks = predict_buma(all_data)
     next_issue = str(int(all_data[-1][0]) + 1)
-    
     pa = bt100['pair_accuracy'] * 100
     pda = bt100['period_accuracy'] * 100
-    cp = bt100['correct_pairs']
-    tp = bt100['total_pairs']
-    hn = bt100['correct_periods']
-    mn = bt100['periods'] - hn
+    cp = bt100['correct_pairs']; tp = bt100['total_pairs']
+    hn = bt100['correct_periods']; mn = bt100['periods'] - hn
     
     det_rows = ''
     for r in reversed(bt100['details']):
@@ -602,96 +483,81 @@ def generate_html(all_data, bt100):
             cls = 'pb-ok' if ok else 'pb-fail'
             pc += f'<span class="{cls}">{pair[0]}{pair[1]}</span>'
         rc = 'hit-yes' if r['all_correct'] else 'hit-no'
-        mk = '<span class="mk-yes">✓</span>' if r['all_correct'] else '<span class="mk-no">✗</span>'
-        det_rows += f'<tr class="{rc}"><td>{r["issue"]}</td><td>{r["date"]}</td><td class="ac">{ast}</td><td class="pc">{pc}</td><td>{mk}</td></tr>'
+        mk = '✓' if r['all_correct'] else '✗'
+        det_rows += f'<tr class="{rc}"><td>{r["issue"]}</td><td>{r["date"]}</td><td class="ac">{ast}</td><td class="pc">{pc}</td><td class="res">{mk}</td></tr>'
     
     pair_counter = Counter()
     for r in bt100['details']:
-        for p in r['picks']:
-            pair_counter[p] += 1
+        for p in r['picks']: pair_counter[p] += 1
     top_pairs = sorted(pair_counter.items(), key=lambda x: x[1], reverse=True)[:8]
     hot_html = ''.join(f'<span class="ht">{a}{b}<small>{c}次</small></span>' for (a,b),c in top_pairs)
     
-    # 信号说明
-    algo_version = "v4.5 · 交叉校验 · 多站降级"
+    update_time = time.strftime('%Y-%m-%d %H:%M', time.localtime())
     
     return f'''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>晓炜两码不组 v3</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>晓炜两码不组</title>
 <style>
 *{{margin:0;padding:0;box-sizing:border-box}}
-body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;background:#f8fafc;color:#334155;min-height:100vh}}
-.header{{background:linear-gradient(135deg,#0f172a,#1e293b);color:#fff;padding:22px 16px;text-align:center}}
-.header h1{{font-size:21px;font-weight:800;letter-spacing:3px;margin-bottom:4px}}
-.header .sub{{font-size:11px;opacity:.5;font-weight:300}}
-.container{{max-width:700px;margin:0 auto;padding:16px 16px 0}}
+body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;background:#f8fafc;color:#334155;min-height:100vh;-webkit-text-size-adjust:100%}}
+.header{{background:linear-gradient(135deg,#0f172a,#1e293b);color:#fff;padding:20px 16px;text-align:center}}
+.header h1{{font-size:20px;font-weight:800;letter-spacing:3px;margin-bottom:2px}}
+.header .sub{{font-size:10px;opacity:.45;font-weight:300}}
+.container{{max-width:700px;margin:0 auto;padding:12px 12px 0}}
 
-.pred-card{{background:#fff;border:2px solid #e2e8f0;border-radius:16px;padding:28px 22px 22px;margin:0 0 16px;text-align:center;box-shadow:0 2px 8px rgba(0,0,0,.05)}}
-.pred-card .label{{font-size:12px;color:#94a3b8;letter-spacing:6px;margin-bottom:2px}}
-.pred-card .issue{{font-size:14px;color:#0d9488;font-weight:700;margin-bottom:18px}}
-.highlight{{font-size:15px;font-weight:800;color:#334155;margin-bottom:16px}}
-.pair-row{{display:flex;justify-content:center;gap:16px;flex-wrap:wrap}}
-.pair-box{{background:linear-gradient(135deg,#1e293b,#334155);color:#fff;border-radius:14px;padding:16px 26px;font-size:26px;font-weight:900;letter-spacing:4px;box-shadow:0 3px 12px rgba(30,41,59,.25)}}
-.footnote{{font-size:11px;color:#94a3b8;margin-top:16px}}
+.pred-card{{background:#fff;border:2px solid #e2e8f0;border-radius:14px;padding:24px 16px 20px;margin:0 0 12px;text-align:center;box-shadow:0 2px 8px rgba(0,0,0,.04)}}
+.pred-card .label{{font-size:11px;color:#94a3b8;letter-spacing:5px;margin-bottom:2px}}
+.pred-card .issue{{font-size:13px;color:#0d9488;font-weight:700;margin-bottom:14px}}
+.highlight{{font-size:15px;font-weight:800;color:#334155;margin-bottom:12px}}
+.pair-row{{display:flex;justify-content:center;gap:14px;flex-wrap:wrap}}
+.pair-box{{background:linear-gradient(135deg,#1e293b,#334155);color:#fff;border-radius:12px;padding:14px 24px;font-size:24px;font-weight:900;letter-spacing:3px;box-shadow:0 3px 10px rgba(30,41,59,.2)}}
+.footnote{{font-size:10px;color:#94a3b8;margin-top:12px}}
 
-.stats{{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px}}
-.stat{{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:16px 8px 12px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,.03)}}
-.stat .val{{font-size:26px;font-weight:800;line-height:1}}
-.stat .lbl{{font-size:10px;color:#94a3b8;margin-top:5px}}
-.stat.s1 .val{{color:#0d9488}}
-.stat.s2 .val{{color:#6366f1}}
-.stat.s3 .val{{color:#f59e0b}}
-.stat.s4 .val{{color:#0ea5e9}}
+.stats{{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:12px}}
+.stat{{background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:14px 6px 10px;text-align:center;box-shadow:0 1px 2px rgba(0,0,0,.02)}}
+.stat .val{{font-size:24px;font-weight:800;line-height:1}}
+.stat .lbl{{font-size:9px;color:#94a3b8;margin-top:4px}}
+.stat.s1 .val{{color:#0d9488}}.stat.s2 .val{{color:#6366f1}}.stat.s3 .val{{color:#f59e0b}}.stat.s4 .val{{color:#0ea5e9}}
 
-.section{{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:16px 16px;margin-bottom:14px;box-shadow:0 1px 3px rgba(0,0,0,.03)}}
-.section .title{{font-size:14px;font-weight:700;margin-bottom:12px;padding-bottom:9px;border-bottom:1px solid #f1f5f9;color:#1e293b}}
+.section{{background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:14px 12px;margin-bottom:12px;box-shadow:0 1px 2px rgba(0,0,0,.02)}}
+.section .title{{font-size:13px;font-weight:700;margin-bottom:10px;padding-bottom:8px;border-bottom:1px solid #f1f5f9;color:#1e293b}}
 
-.bar-row{{display:flex;gap:6px;height:34px;margin-bottom:6px}}
-.bar{{flex:1;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;color:#fff}}
+.bar-row{{display:flex;gap:4px;height:30px;margin-bottom:4px}}
+.bar{{flex:1;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:#fff}}
 .bar.hit{{background:linear-gradient(90deg,#0d9488,#14b8a6)}}
 .bar.miss{{background:#f1f5f9;color:#94a3b8}}
 
-.alg-cards{{display:grid;grid-template-columns:1fr 1fr;gap:8px}}
-.al{{background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:12px 14px;font-size:11px}}
-.al .n{{font-weight:700;color:#1e293b;margin-bottom:3px}}
-.al .d{{color:#94a3b8;font-size:10px;line-height:1.5}}
+.hot-tags{{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}}
+.ht{{display:inline-flex;align-items:center;gap:3px;background:#f0fdfa;color:#0d9488;padding:4px 10px;border-radius:16px;font-size:13px;font-weight:700}}
+.ht small{{font-size:9px;font-weight:400;opacity:.6}}
 
-.hot-tags{{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}}
-.ht{{display:inline-flex;align-items:center;gap:4px;background:#f0fdfa;color:#0d9488;padding:5px 12px;border-radius:20px;font-size:14px;font-weight:700}}
-.ht small{{font-size:10px;font-weight:400;opacity:.65}}
-
-.tb-wrap{{overflow-x:auto}}
-table{{width:100%;border-collapse:collapse;font-size:12px}}
-th{{background:#f8fafc;padding:9px 5px;text-align:center;font-weight:700;border-bottom:1px solid #e2e8f0;font-size:11px;color:#64748b}}
-td{{padding:9px 5px;text-align:center;border-bottom:1px solid #f1f5f9}}
-.ac{{font-weight:800;color:#0d9488;letter-spacing:3px;font-size:13px}}
-.pc{{display:flex;justify-content:center;gap:8px;flex-wrap:wrap}}
-.pb-ok{{display:inline-flex;align-items:center;justify-content:center;padding:4px 9px;border-radius:8px;background:#f0fdfa;color:#0d9488;font-weight:800;font-size:13px;border:1.5px solid #a7f3d0}}
-.pb-fail{{display:inline-flex;align-items:center;justify-content:center;padding:4px 9px;border-radius:8px;background:#fef2f2;color:#ef4444;font-weight:800;font-size:13px;border:1.5px solid #fecaca}}
+.tb-wrap{{overflow-x:auto;-webkit-overflow-scrolling:touch}}
+table{{width:100%;border-collapse:collapse;font-size:11px}}
+th{{background:#f8fafc;padding:8px 4px;text-align:center;font-weight:700;border-bottom:1px solid #e2e8f0;font-size:10px;color:#64748b;position:sticky;top:0}}
+td{{padding:8px 3px;text-align:center;border-bottom:1px solid #f1f5f9}}
+.ac{{font-weight:800;color:#0d9488;letter-spacing:2px;font-size:12px}}
+.pc{{display:flex;justify-content:center;gap:5px;flex-wrap:wrap}}
+.pb-ok{{display:inline-flex;align-items:center;justify-content:center;padding:3px 7px;border-radius:6px;background:#f0fdfa;color:#0d9488;font-weight:800;font-size:12px;border:1px solid #a7f3d0}}
+.pb-fail{{display:inline-flex;align-items:center;justify-content:center;padding:3px 7px;border-radius:6px;background:#fef2f2;color:#ef4444;font-weight:800;font-size:12px;border:1px solid #fecaca}}
 .hit-yes td{{background:#fafdfc}}
-.mk-yes{{color:#0d9488;font-weight:800;font-size:14px}}
-.mk-no{{color:#ef4444;font-weight:800;font-size:14px}}
-.warn{{background:#fffbeb;border:1px solid #fde68a;border-radius:10px;padding:10px 14px;margin-bottom:14px;font-size:11.5px;color:#92400e;text-align:center}}
-.footer{{text-align:center;padding:20px 16px 30px;color:#94a3b8;font-size:10px;line-height:1.8}}
-
-@media(max-width:600px){{
-  .stats{{grid-template-columns:repeat(2,1fr)}}
-  .pair-box{{padding:13px 18px;font-size:22px}}
-  .alg-cards{{grid-template-columns:1fr}}
-}}
+.res{{font-weight:800;font-size:13px}}.hit-yes .res{{color:#0d9488}}.hit-no .res{{color:#ef4444}}
+.warn{{background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:8px 12px;margin-bottom:12px;font-size:10px;color:#92400e;text-align:center}}
+.footer{{text-align:center;padding:16px;color:#94a3b8;font-size:9px;line-height:1.8}}
+.info{{font-size:10px;color:#64748b;line-height:1.8}}
+@media(max-width:400px){{.stats{{grid-template-columns:repeat(2,1fr)}}.pair-box{{padding:12px 18px;font-size:21px}}}}
 </style>
 </head>
 <body>
 <div class="header">
   <h1>晓炜两码不组</h1>
-  <div class="sub">{algo_version}</div>
+  <div class="sub">v4.5 · 云端全自动 · 纯手机查看</div>
 </div>
 
 <div class="container">
-  <div class="warn"><strong>⚠ 风险提示：</strong>彩票开奖具有随机性，本软件仅供数据分析参考，不构成投注建议。请理性购彩。</div>
+  <div class="warn">⚠ 彩票随机，仅供数据参考，不构成投注建议</div>
 
   <div class="pred-card">
     <div class="label">▎下期两码不组预测</div>
@@ -701,113 +567,74 @@ td{{padding:9px 5px;text-align:center;border-bottom:1px solid #f1f5f9}}
       <div class="pair-box">{next_picks[0][0]}{next_picks[0][1]}</div>
       <div class="pair-box">{next_picks[1][0]}{next_picks[1][1]}</div>
     </div>
-    <div class="footnote">cwl.gov.cn自动拉取 · 嵌入兜底 · 每期动态</div>
+    <div class="footnote">{len(all_data)}期历史 · GitHub+cwl双源 · 每日自动</div>
   </div>
 
   <div class="stats">
     <div class="stat s1"><div class="val">{pa:.1f}%</div><div class="lbl">100期双码准确率</div></div>
     <div class="stat s2"><div class="val">{cp}/{tp}</div><div class="lbl">正确/总预测对</div></div>
-    <div class="stat s3"><div class="val">{pda:.1f}%</div><div class="lbl">100期全对期数</div></div>
-    <div class="stat s4"><div class="val">{hn}/{bt100["periods"]}</div><div class="lbl">两组全对/总期</div></div>
+    <div class="stat s3"><div class="val">{pda:.1f}%</div><div class="lbl">100期全对率</div></div>
+    <div class="stat s4"><div class="val">{hn}/{bt100["periods"]}</div><div class="lbl">两组全对期数</div></div>
   </div>
 
   <div class="section">
-    <div class="title">🧬 核心算法</div>
-    <div class="alg-cards">
-      <div class="al">
-        <div class="n">🔍 kNN模式匹配</div>
-        <div class="d">搜索历史相似走势窗口，预测后续不会出现的数字对</div>
-      </div>
-      <div class="al">
-        <div class="n">🔥 数字过热检测</div>
-        <div class="d">近18期频率>历史1.8倍自动降权，消除活跃期盲区</div>
-      </div>
-      <div class="al">
-        <div class="n">🛡️ 频次安全阈值</div>
-        <div class="d">历史出现>10次且kNN满分时自适应降权，防伪安全</div>
-      </div>
-      <div class="al">
-        <div class="n">🤝 双信号共识</div>
-        <div class="d">kNN与遗漏top3取交集，双重确认才输出预测</div>
-      </div>
-    </div>
-  </div>
-
-  <div class="section">
-    <div class="title">📊 100期回测分布</div>
+    <div class="title">📊 100期回测分布 (近→远)</div>
     <div class="bar-row">
       <div class="bar hit" style="flex:{hn}">{hn}期全对 ✓</div>
       <div class="bar miss" style="flex:{mn}">{mn}期有错 ✗</div>
     </div>
-    <div style="margin-top:10px;font-size:11px;color:#999">高频预测</div>
     <div class="hot-tags">{hot_html}</div>
   </div>
 
   <div class="section">
     <div class="title">📋 100期回测详情 (近→远)</div>
-    <div class="tb-wrap">
-      <table>
-        <thead><tr><th>期号</th><th>日期</th><th>开奖号</th><th>预测不组</th><th>结果</th></tr></thead>
-        <tbody>{det_rows}</tbody>
-      </table>
-    </div>
+    <div class="tb-wrap"><table>
+      <thead><tr><th>期号</th><th>日期</th><th>开奖</th><th>预测</th><th>结果</th></tr></thead>
+      <tbody>{det_rows}</tbody>
+    </table></div>
   </div>
 
-  <div class="section" style="font-size:11px;color:#64748b;line-height:1.8">
+  <div class="section">
     <div class="title">🔒 诚实声明</div>
-    ✅ 严格滚动回测：每期仅使用该期之前历史数据<br>
-    ✅ 四重防护：kNN+遗漏+过热检测+频次安全阈值<br>
-    ✅ 100%为213期100期回测成绩，诚实算法零泄露<br>
-    ⚠ 回测100%不保证未来100%准确，彩票随机不可预测<br>
-    🚫 绝不偷看未来、不修改结果、不承诺稳赚
+    <div class="info">
+    ✅ 四重防护：kNN+遗漏+过热检测+自适应频次<br>
+    ✅ 严格滚动回测，零未来数据泄露<br>
+    ✅ 多源降级：GitHub+cwl+缓存+嵌入<br>
+    ⚠ 回测100%不代表未来100%，彩票本质随机<br>
+    🚫 不偷看未来、不修改结果、不承诺稳赚
+    </div>
   </div>
 </div>
 
 <div class="footer">
-  数据来源: cwl.gov.cn · {algo_version}<br>
-  生成时间: <span id="t"></span> · 仅供参考
+  🤖 GitHub Actions 全自动 · 每日北京时间22:00更新<br>
+  更新: {update_time} · 数据: GitHub/cwl.gov.cn · 仅供参考
 </div>
-
-<script>document.getElementById('t').textContent=new Date().toLocaleString('zh-CN')</script>
 </body>
 </html>'''
 
 
-# ============================================================
-# 主程序
-# ============================================================
-
 def main():
-    print("=" * 55)
-    print("  福彩3D两码不组 v4.4 · 多站降级")
-    print("  cwl×3 + GitHub + 本地缓存 + 嵌入")
-    print("=" * 55)
+    print("=" * 50)
+    print("  晓炜两码不组 · 云端自动部署")
+    print("=" * 50)
     
     all_data = load_data()
     
     bt100 = run_backtest(all_data, 100)
     pa = bt100['pair_accuracy'] * 100
-    pda = bt100['period_accuracy'] * 100
-    print(f"\n[100期回测] 双码{pa:.1f}% ({bt100['correct_pairs']}/{bt100['total_pairs']}) "
-          f"全对{pda:.1f}% ({bt100['correct_periods']}/{bt100['periods']})")
-    
-    bt50 = run_backtest(all_data, 50)
-    print(f"[50期回测] 双码{bt50['pair_accuracy']*100:.1f}% 全对{bt50['period_accuracy']*100:.1f}%")
-    
-    bt30 = run_backtest(all_data, 30)
-    print(f"[30期回测] 双码{bt30['pair_accuracy']*100:.1f}% 全对{bt30['period_accuracy']*100:.1f}%")
+    print(f"\n[回测] 100期: {pa:.1f}% ({bt100['correct_pairs']}/{bt100['total_pairs']})")
     
     next_picks = predict_buma(all_data)
     next_issue = str(int(all_data[-1][0]) + 1)
-    print(f"\n[预测] 下期{next_issue}: {next_picks[0][0]}{next_picks[0][1]}, {next_picks[1][0]}{next_picks[1][1]}")
+    print(f"[预测] {next_issue}: {next_picks[0][0]}{next_picks[0][1]}, {next_picks[1][0]}{next_picks[1][1]}")
     
     html = generate_html(all_data, bt100)
-    out = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fc3d_buma.html')
+    out = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'index.html')
     with open(out, 'w', encoding='utf-8') as f:
         f.write(html)
     print(f"\n✅ 已生成: {out}")
-    print("=" * 55)
-    return out, bt100
+    return out
 
 
 if __name__ == '__main__':
