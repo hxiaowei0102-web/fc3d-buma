@@ -4,11 +4,14 @@
 福彩3D两码不组 — 云端自动部署版
 GitHub Actions 每日常规运行, 零人工干预
 """
-import os, math, json, time
+import os, math, json, time, random, re
 from collections import Counter
 import urllib.request
+import urllib.error
 import http.cookiejar
 import base64
+import threading
+import concurrent.futures
 
 ALL_PAIRS = [(a, b) for a in range(10) for b in range(a + 1, 10)]
 CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fc3d_cache.json')
@@ -286,13 +289,42 @@ def run_backtest(all_data, n=100):
     }
 
 # ============================================================
-# 多源数据获取 (云端优化: GitHub优先)
+# 多源数据获取 v5.1 — 五源并行+重试+投票
 # ============================================================
+
+RETRY_MAX = 3
+RETRY_BASE_DELAY = 1.5  # 秒, 指数退避: 1.5 → 3 → 6
+
+def _retry_fetch(fn, name, *args, **kwargs):
+    """带指数退避的重试包装器"""
+    for attempt in range(RETRY_MAX):
+        try:
+            result = fn(*args, **kwargs)
+            if result:
+                return result
+        except Exception as e:
+            delay = RETRY_BASE_DELAY * (2 ** attempt)
+            if attempt < RETRY_MAX - 1:
+                print(f"  ⚡ {name} 第{attempt+1}次重试({delay:.0f}s)...")
+                time.sleep(delay)
+    return None
 
 def _try_fetch(url, headers, timeout=15):
     req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read())
+
+def _try_fetch_text(url, headers, timeout=12):
+    """获取纯文本内容"""
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+        # 尝试检测编码
+        for enc in ['utf-8', 'gb2312', 'gbk', 'gb18030']:
+            try:
+                return raw.decode(enc)
+            except: continue
+        return raw.decode('utf-8', errors='replace')
 
 def _parse_cwl(raw):
     if raw.get('state') != 0: return []
@@ -382,6 +414,124 @@ def fetch_ruseo():
         return None
     except: return None
 
+def fetch_zhcw():
+    """中彩网 (官方合作伙伴, 多URL备选)
+    实测: jc.zhcw.com 会根据IP地域返回不同格式, 多路尝试
+    """
+    headers_mobile = {
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Mobile',
+        'Referer': 'https://m.zhcw.com/',
+    }
+    headers_pc = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Referer': 'https://www.zhcw.com/',
+    }
+    
+    # 3套URL备选, 按优先级
+    url_attempts = [
+        # 方案1: 手机版API (最稳定)
+        ('https://m.zhcw.com/api/lottery/kjxx/getKjxx?lotteryType=fc3d&issueCount=100', headers_mobile),
+        # 方案2: PC版JSONP接口
+        ('https://jc.zhcw.com/port/client_json.php?callback=j&transactionType=10001001&lotteryId=4&issueCount=100&startIssue=0&endIssue=0', headers_pc),
+        # 方案3: 新版API
+        ('https://www.zhcw.com/api/lottery/kjxx/getKjxx?lotteryType=fc3d&issueCount=100', headers_pc),
+    ]
+    
+    for url, headers in url_attempts:
+        try:
+            text = _try_fetch_text(url, headers, timeout=10)
+            if not text: continue
+            
+            # 清理JSONP包装
+            text = text.strip()
+            if text.startswith('j(') and text.endswith(')'):
+                text = text[2:-1]
+            if text.startswith('(') and text.endswith(')'):
+                text = text[1:-1]
+            
+            raw = json.loads(text)
+            if raw.get('resCode') == '9998':
+                continue  # 参数不全, 换下一套
+            
+            # 尝试多种数据字段名
+            items = (raw.get('data') or raw.get('result') or raw.get('list') or [])
+            if isinstance(items, dict):
+                items = items.get('list') or items.get('rows') or []
+            
+            results = []
+            for item in items:
+                try:
+                    code = str(item.get('issue') or item.get('lotteryDrawNum') or item.get('phase', ''))
+                    nums = item.get('lotteryDrawResult') or item.get('awardNum') or item.get('result', '')
+                    if isinstance(nums, str):
+                        digits = [int(c) for c in re.findall(r'\d', nums)]
+                    elif isinstance(nums, list):
+                        digits = [int(str(n)) for n in nums]
+                    date = str(item.get('lotteryDrawTime') or item.get('drawDate') or item.get('time', ''))[:10]
+                    if len(digits) == 3 and code:
+                        results.append([code, date, digits])
+                except: continue
+            
+            if results:
+                results.sort(key=lambda x: x[0])
+                return results
+        except: continue
+    
+    return None
+
+def fetch_aicai():
+    """爱彩网 (商业平台, 多URL备选, 分页获取)"""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36',
+    }
+    
+    # 多套API备选
+    url_configs = [
+        ('https://www.aicai.com/open/advice/getKjHistoryNew.do', {'lotId': '1400', 'gameIndex': '0'}),
+        ('https://m.aicai.com/api/lottery/getKjHistory.do', {'lotId': '1400'}),
+    ]
+    
+    for base_url, base_params in url_configs:
+        all_results = []
+        try:
+            for page in [1, 2]:
+                params = {**base_params, 'pageNo': str(page), 'pageSize': '100'}
+                url = base_url + '?' + '&'.join(f'{k}={v}' for k, v in params.items())
+                req = urllib.request.Request(url, headers={**headers, 'Referer': 'https://www.aicai.com/'})
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    raw = json.loads(resp.read())
+                
+                if raw.get('respCode') != '0000' and raw.get('code') != 0:
+                    break
+                
+                items = (raw.get('data', {}).get('result') or raw.get('data') or raw.get('result') or [])
+                if not items or not isinstance(items, list):
+                    break
+                
+                for item in items:
+                    try:
+                        code = str(item.get('lotteryDrawNum') or item.get('phase') or item.get('issue', ''))
+                        nums = item.get('lotteryDrawResult') or item.get('result') or item.get('awardNum', '')
+                        digits = []
+                        if isinstance(nums, str):
+                            digits = [int(c) for c in nums if c.isdigit()]
+                            if len(digits) != 3:
+                                digits = [int(n.strip()) for n in nums.split() if n.strip().isdigit()]
+                        date = str(item.get('lotteryDrawTime') or item.get('time') or item.get('drawDate', ''))[:10]
+                        if len(digits) == 3 and code:
+                            all_results.append([code, date, digits])
+                    except: continue
+                
+                if len(items) < 50:
+                    break
+            
+            if all_results:
+                all_results.sort(key=lambda x: x[0])
+                return all_results
+        except: continue
+    
+    return None
+
 def fetch_cache():
     if os.path.exists(CACHE_FILE):
         try:
@@ -399,26 +549,66 @@ def save_cache(data):
     except: pass
 
 def load_data():
-    """云端: 嵌入+cwl+缓存训练, GitHub降级+交叉校验自动纠正"""
-    print("[数据] 多源获取...")
+    """v5.1 五源并行获取 + 多数投票 + 完整性校验
+    源1: 澄曜API (最新1期, 免费)
+    源2: cwl.gov.cn (官方, 最近80期)
+    源3: 中彩网 zhcw.com (官方合作, 100期)
+    源4: 爱彩网 aicai.com (商业平台, 200期)
+    源5: GitHub FSloper/lottery_data (8322期全量, 权威校验)
     
+    策略:
+    - 5源并行抓取 (ThreadPool)
+    - 每个源3次重试+指数退避
+    - 同号多数据冲突时: 3+源一致→采信多数; 2:2平→GitHub裁决
+    - 数据完整性自动检测 + 缓存持久化
+    """
+    print("[数据] v5.1 五源并行获取...")
+    gh_token = os.environ.get('GITHUB_TOKEN', None)
+    
+    # ============ Phase 1: 并行抓取所有源 ============
+    src_results = {}
+    src_ok = {}
+    
+    def _fetch_one(fn, name, *args):
+        result = _retry_fetch(fn, name, *args)
+        ok = result is not None and len(result) > 0
+        src_ok[name] = ok
+        tag = 'OK' if ok else 'OFFLINE'
+        cnt = len(result) if ok else 0
+        print(f"  [{tag}] {name}: {cnt}期")
+        return result
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {
+            executor.submit(_fetch_one, fetch_ruseo, '澄曜'): 'ruseo',
+            executor.submit(_fetch_one, fetch_cwl, 'cwl官网'): 'cwl',
+            executor.submit(_fetch_one, fetch_zhcw, '中彩网'): 'zhcw',
+            executor.submit(_fetch_one, fetch_aicai, '爱彩网'): 'aicai',
+            executor.submit(_fetch_one, fetch_github, 'GitHub', gh_token): 'github',
+        }
+        for f in concurrent.futures.as_completed(futures):
+            src_name = futures[f]
+            try:
+                src_results[src_name] = f.result()
+            except:
+                src_results[src_name] = None
+    
+    online_count = sum(1 for v in src_ok.values() if v)
+    online_names = [k for k, v in src_ok.items() if v]
+    print(f"  >> 在线源: {online_count}/5 ({', '.join(online_names)})")
+    
+    # ============ Phase 2: 加载本地数据(嵌入+缓存) ============
     data = list(EMBEDDED)
-    # 嵌入自动刷新: 如果 fc3d_embedded.json 存在且比硬编码多, 用它
     if os.path.exists(EMBED_FILE):
         try:
             with open(EMBED_FILE, 'r', encoding='utf-8') as f:
                 emb_data = json.load(f)
             if len(emb_data) > len(EMBEDDED):
                 data = emb_data
-                print(f"  嵌入(自动): {len(data)}期 (已刷新)")
         except: pass
     existing = {d[0] for d in data}
-    print(f"  嵌入: {len(data)}期 ({data[0][0]}~{data[-1][0]})")
+    print(f"  基础: {len(data)}期 ({data[0][0]}~{data[-1][0]})")
     
-    # GitHub token (Actions 自带, 本地无)
-    gh_token = os.environ.get('GITHUB_TOKEN', None)
-    
-    # 缓存补充
     cache = fetch_cache()
     if cache:
         n = 0
@@ -427,89 +617,113 @@ def load_data():
                 data.append(rec); existing.add(rec[0]); n += 1
         if n: print(f"  缓存: +{n}期")
     
-    # 多源获取: 澄曜(主) → cwl(备用) → GitHub(兜底)
-    new_data_ok = False
+    # ============ Phase 3: 多数投票合并多源数据 ============
+    # 构建每期多源视图: {issue: {source_name: (digits, date)}}
+    multi_view = {}
+    for src_name, src_data in src_results.items():
+        if not src_data: continue
+        for rec in src_data:
+            issue = rec[0]
+            if issue is None: continue
+            if issue not in multi_view:
+                multi_view[issue] = {}
+            multi_view[issue][src_name] = (tuple(rec[2]), rec[1])
     
-    # 源1: 澄曜API (免费, 最新1期)
-    ruseo_data = fetch_ruseo()
-    if ruseo_data:
-        n = 0
-        latest_issue = max(existing) if existing else '0'
-        for rec in ruseo_data:
-            # 澄曜返回None作为期号, 我们根据上一期+1生成
-            issue_num = rec[0]
-            if issue_num is None:
-                issue_num = str(int(latest_issue) + 1)
-            rec[0] = issue_num
-            if rec[0] not in existing:
-                data.append(rec); existing.add(rec[0]); n += 1
-        if n: print(f"  澄曜: +{n}期 ✓")
-        new_data_ok = True
-    else:
-        print(f"  ⚠ 澄曜离线")
+    new_count = 0
+    conflict_resolved = 0
     
-    # 源2: cwl.gov.cn (更多历史)
-    cwl_data = fetch_cwl()
-    if cwl_data:
-        n = 0
-        for rec in cwl_data:
-            if rec[0] not in existing:
-                data.append(rec); existing.add(rec[0]); n += 1
-        if n: print(f"  cwl: +{n}期 ✓")
-        new_data_ok = True
-    else:
-        print(f"  ⚠ cwl离线!")
-    
-    # 源3: 降级 - cwl/澄曜都失败时从GitHub补充
-    if not new_data_ok:
-        print(f"  🠖 降级: GitHub补充...", end='')
-        gh = fetch_github(gh_token)
-        if gh:
-            latest_existing = max(existing) if existing else '0'
-            n = 0
-            for rec in gh:
-                if rec[0] > latest_existing and rec[0] not in existing:
-                    data.append(rec); existing.add(rec[0]); n += 1
-            if n:
-                print(f" +{n}期 ✓")
-                new_data_ok = True
+    for issue, sources in multi_view.items():
+        if issue in existing:
+            continue
+        
+        vote_map = {}
+        best_date = ''
+        for src_name, (digits_tup, date_str) in sources.items():
+            vote_map.setdefault(digits_tup, []).append(src_name)
+            if date_str and (not best_date or date_str > best_date):
+                best_date = date_str
+        
+        if len(vote_map) == 1:
+            digits_tup = list(vote_map.keys())[0]
+        elif len(vote_map) >= 2:
+            sorted_votes = sorted(vote_map.items(), key=lambda x: len(x[1]), reverse=True)
+            winner, winner_sources = sorted_votes[0]
+            runner_up, runner_sources = sorted_votes[1]
+            if len(winner_sources) > len(runner_sources):
+                digits_tup = winner
             else:
-                print(f" 0期(已最新)")
-        else:
-            print(f" 离线")
+                if 'github' in sources:
+                    digits_tup = sources['github'][0]
+                elif 'cwl' in sources:
+                    digits_tup = sources['cwl'][0]
+                else:
+                    digits_tup = winner
+                conflict_resolved += 1
+        
+        data.append([issue, best_date, list(digits_tup)])
+        existing.add(issue)
+        new_count += 1
+    
+    if new_count:
+        extra = f" (解决{conflict_resolved}个冲突)" if conflict_resolved else ""
+        print(f"  多源合并: +{new_count}期{extra}")
     
     data.sort(key=lambda x: x[0])
     
-    # 交叉校验 + 自动纠正
-    print(f"  🠖 交叉校验...", end='')
-    gh = fetch_github(gh_token)
-    if gh:
-        gh_map = {r[0]: tuple(r[2]) for r in gh}
+    # ============ Phase 4: GitHub全量交叉校验 (自动修正) ============
+    if src_ok.get('github'):
+        gh_data = src_results['github']
+        gh_map = {r[0]: tuple(r[2]) for r in gh_data}
         checked = mismatch = corrected = 0
         for i, rec in enumerate(data):
             if rec[0] in gh_map:
                 checked += 1
                 if tuple(rec[2]) != gh_map[rec[0]]:
                     mismatch += 1
-                    # 自动纠正: 用GitHub数据覆盖cwl脏数据
                     data[i][2] = list(gh_map[rec[0]])
                     corrected += 1
         if checked > 0:
             if mismatch == 0:
-                print(f" GitHub {checked}期一致 ✓")
+                print(f"  >> GitHub校验: {checked}期一致")
             else:
-                print(f" ⚠ GitHub {mismatch}/{checked}期不一致 → 已自动纠正{corrected}期 ✓")
-        else:
-            print(f" 无重叠期")
-    else:
-        print(f" GitHub离线")
+                print(f"  !! GitHub校验: {mismatch}/{checked}期不一致 -> 已修正{corrected}期")
     
+    # ============ Phase 5: 数据完整性校验 ============
+    _validate_integrity(data)
+    
+    # ============ Phase 6: 持久化缓存 ============
     save_cache(data)
     
     n = len(data)
-    from_src = "澄曜+cwl" if new_data_ok else "缓存+嵌入"
-    print(f"[数据] 共{n}期: {data[0][0]}~{data[-1][0]} (源: {from_src})")
+    online_info = '+'.join(online_names) if online_names else '缓存+嵌入'
+    print(f"[数据] 共{n}期: {data[0][0]}~{data[-1][0]} (源: {online_info})")
     return data
+
+
+def _validate_integrity(data):
+    """数据完整性校验"""
+    issues = [int(d[0]) for d in data]
+    dupes = len(issues) - len(set(issues))
+    gaps = []
+    for i in range(1, len(issues)):
+        diff = issues[i] - issues[i-1]
+        if diff != 1:
+            prev_year = issues[i-1] // 1000
+            curr_year = issues[i] // 1000
+            if prev_year != curr_year:
+                continue
+            if diff > 1:
+                gaps.append((issues[i-1], issues[i], diff))
+    bad = sum(1 for d in data if not all(0 <= x <= 9 for x in d[2]))
+    if dupes:
+        print(f"  !! 完整性: {dupes}条重复")
+    if gaps:
+        gap_info = ', '.join(f'{a}-{b}(缺{diff-1})' for a, b, diff in gaps[:3])
+        print(f"  !! 完整性: {len(gaps)}个缺口 ({gap_info})")
+    if bad:
+        print(f"  !! 完整性: {bad}条非法号码")
+    if not dupes and not gaps and not bad:
+        print(f"  >> 完整性: OK")
 
 # ============================================================
 # HTML 生成
@@ -601,7 +815,7 @@ td{{padding:8px 3px;text-align:center;border-bottom:1px solid #f1f5f9}}
 <body>
 <div class="header">
   <h1>晓炜两码不组</h1>
-  <div class="sub">v4.5 · 云端全自动 · 纯手机查看</div>
+  <div class="sub">v5.1 · 五源并行 · 云端全自动</div>
 </div>
 
 <div class="container">
@@ -615,7 +829,7 @@ td{{padding:8px 3px;text-align:center;border-bottom:1px solid #f1f5f9}}
       <div class="pair-box">{next_picks[0][0]}{next_picks[0][1]}</div>
       <div class="pair-box">{next_picks[1][0]}{next_picks[1][1]}</div>
     </div>
-    <div class="footnote">{len(all_data)}期历史 · GitHub+cwl双源 · 每日自动</div>
+    <div class="footnote">{len(all_data)}期历史 · 澄曜+cwl+中彩网+爱彩网+GitHub · 五源并行</div>
   </div>
 
   <div class="stats">
@@ -645,9 +859,9 @@ td{{padding:8px 3px;text-align:center;border-bottom:1px solid #f1f5f9}}
   <div class="section">
     <div class="title">🔒 诚实声明</div>
     <div class="info">
-    ✅ 四重防护：kNN+遗漏+过热检测+自适应频次<br>
-    ✅ 严格滚动回测，零未来数据泄露<br>
-    ✅ 多源降级：GitHub+cwl+缓存+嵌入<br>
+    ✅ 五源并行+重试+投票, 零未来数据泄露<br>
+    ✅ 严格滚动回测, 零未来数据泄露<br>
+    ✅ 五源降级: 澄曜+cwl+中彩网+爱彩网+GitHub<br>
     ⚠ 回测100%不代表未来100%，彩票本质随机<br>
     🚫 不偷看未来、不修改结果、不承诺稳赚
     </div>
