@@ -28,6 +28,12 @@ jobs:
       - name: 检查是否需要更新
         id: check
         run: |
+          # 手动触发(workflow_dispatch) 强制运行, 不检查重复
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "skipped=false" >> $GITHUB_OUTPUT
+            echo "手动触发, 强制执行"
+            exit 0
+          fi
           TODAY=$(TZ='Asia/Shanghai' date +'%Y-%m-%d')
           if git log -1 --pretty=format:"%s" | grep -q "$TODAY"; then
             echo "skipped=true" >> $GITHUB_OUTPUT
