@@ -196,8 +196,10 @@ def gap_scores(history):
         gap[p] = n - 1 - last if last >= 0 else n
     return gap
 
-def predict_buma(history):
-    """预测: 纯净数据(嵌入+cwl+缓存), 与本地版一致"""
+def predict_buma(history, max_history=300):
+    """预测: 只用最近max_history期, 避免全量8537期数据干扰kNN"""
+    if len(history) > max_history:
+        history = history[-max_history:]
     n = len(history)
     knn_s = knn_scores(history, k=15, lookback=6)
     if knn_s is None:
@@ -544,8 +546,10 @@ def save_cache(data):
     try:
         with open(CACHE_FILE, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False)
+        # EMBED_FILE 只保留最近215期作为兜底, 避免全量8537期撑大嵌入
+        trimmed = data[-215:] if len(data) > 215 else data
         with open(EMBED_FILE, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False)
+            json.dump(trimmed, f, ensure_ascii=False)
     except: pass
 
 def load_data():
@@ -729,8 +733,45 @@ def _validate_integrity(data):
 # HTML 生成
 # ============================================================
 
-def generate_html(all_data, bt100):
-    next_picks = predict_buma(all_data)
+def get_algorithm_segment(all_data, max_periods=230):
+    """从全量数据提取最近连续数据段, 跳过缺口, 避免不连续数据污染kNN"""
+    if len(all_data) <= max_periods:
+        return list(all_data)
+    # 从结尾往前找最长连续段 (只检查年份内连续性)
+    seg = []
+    prev_issue = None
+    for i in range(len(all_data)-1, -1, -1):
+        cur = all_data[i]
+        cur_issue = int(cur[0])
+        if prev_issue is None:
+            seg.append(cur)
+            prev_issue = cur_issue
+        else:
+            prev_year = prev_issue // 1000
+            cur_year = cur_issue // 1000
+            # 同一年内必须连续, 跨年只检查是否年前年到后年
+            if prev_year == cur_year:
+                if prev_issue - cur_issue == 1:
+                    seg.append(cur)
+                    prev_issue = cur_issue
+                else:
+                    break  # 遇到缺口, 停止
+            else:
+                # 跨年: 2026001接2025351这种
+                if prev_year == cur_year + 1 and cur_issue % 1000 == 351 and prev_issue % 1000 == 1:
+                    seg.append(cur)
+                    prev_issue = cur_issue
+                else:
+                    break
+        if len(seg) >= max_periods:
+            break
+    seg.reverse()
+    return seg
+
+def generate_html(all_data, bt100, algo_data=None):
+    if algo_data is None:
+        algo_data = all_data
+    next_picks = predict_buma(algo_data)
     next_issue = str(int(all_data[-1][0]) + 1)
     pa = bt100['pair_accuracy'] * 100
     pda = bt100['period_accuracy'] * 100
@@ -883,15 +924,19 @@ def main():
     
     all_data = load_data()
     
-    bt100 = run_backtest(all_data, 100)
+    # 只取最近230期用于算法, 避免全量8537期数据干扰kNN
+    algo_data = get_algorithm_segment(all_data, 230)
+    print(f"[算法] 使用最近{len(algo_data)}期 ({algo_data[0][0]}~{algo_data[-1][0]})")
+    
+    bt100 = run_backtest(algo_data, 100)
     pa = bt100['pair_accuracy'] * 100
     print(f"\n[回测] 100期: {pa:.1f}% ({bt100['correct_pairs']}/{bt100['total_pairs']})")
     
-    next_picks = predict_buma(all_data)
+    next_picks = predict_buma(algo_data)
     next_issue = str(int(all_data[-1][0]) + 1)
     print(f"[预测] {next_issue}: {next_picks[0][0]}{next_picks[0][1]}, {next_picks[1][0]}{next_picks[1][1]}")
     
-    html = generate_html(all_data, bt100)
+    html = generate_html(all_data, bt100, algo_data)
     out = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'index.html')
     with open(out, 'w', encoding='utf-8') as f:
         f.write(html)
