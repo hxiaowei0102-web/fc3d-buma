@@ -1,0 +1,48 @@
+name: 手动触发更新
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - '.github/workflows/manual.yml'
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+      
+      - name: 设置Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: 运行预测算法
+        run: |
+          cd docs
+          python fc3d_buma.py
+      
+      - name: 提交更新
+        id: commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/index.html docs/fc3d_cache.json docs/fc3d_embedded.json
+          if git diff --staged --quiet; then
+            echo "无变更, 数据已是最新"
+            exit 0
+          fi
+          git commit -m "🤖 手动触发更新 $(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M')"
+          for i in 1 2 3; do
+            if git pull --rebase origin master 2>/dev/null && git push; then
+              exit 0
+            fi
+            sleep $(($i * 5))
+          done
+          echo "::error::git push 连续3次失败"
+          exit 1
