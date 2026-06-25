@@ -366,26 +366,44 @@ def fetch_github(token=None):
     except: return None
 
 def fetch_cwl():
-    """cwl.gov.cn (3种方式尝试)"""
-    ua_list = [
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Mobile',
-    ]
-    for ua in ua_list:
+    """cwl.gov.cn (session预热 + 多UA + 多URL)"""
+    for attempt in range(2):
         try:
             cj = http.cookiejar.CookieJar()
             opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
-            url = 'https://www.cwl.gov.cn/cwl_admin/front/cwlkj/search/kjxx/findDrawNotice?name=3d&issueCount=80'
-            headers = {
-                'User-Agent': ua,
+            # Step 1: 预热 - 先访问首页获取session cookies
+            try:
+                warmup_req = urllib.request.Request('https://www.cwl.gov.cn/', 
+                    headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                             'Accept': 'text/html,application/xhtml+xml'})
+                opener.open(warmup_req, timeout=8)
+            except: pass  # 预热不是必须的
+            time.sleep(0.5)
+            # Step 2: 调用API (多个URL备选)
+            urls = [
+                'https://www.cwl.gov.cn/cwl_admin/front/cwlkj/search/kjxx/findDrawNotice?name=3d&issueCount=80',
+                'https://www.cwl.gov.cn/cwl_admin/front/cwlkj/search/kjxx/findDrawNotice?name=3d&issueCount=50',
+                'https://www.cwl.gov.cn/cwl_admin/front/cwlkj/search/kjxx/findDrawNotice?name=3d&issueCount=30',
+            ]
+            headers_base = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                 'Referer': 'https://www.cwl.gov.cn/ygkj/wqkjgg/ssq/',
-                'Accept': 'application/json',
+                'Accept': 'application/json, text/plain, */*',
+                'Accept-Language': 'zh-CN,zh;q=0.9',
+                'Origin': 'https://www.cwl.gov.cn',
+                'Cache-Control': 'no-cache',
+                'Connection': 'keep-alive',
             }
-            req = urllib.request.Request(url, headers=headers)
-            with opener.open(req, timeout=15) as resp:
-                result = _parse_cwl(json.loads(resp.read()))
-            if result: return result
-        except: continue
+            for api_url in urls:
+                try:
+                    req = urllib.request.Request(api_url, headers=headers_base)
+                    with opener.open(req, timeout=15) as resp:
+                        result = _parse_cwl(json.loads(resp.read()))
+                    if result: return result
+                except: continue
+        except: 
+            if attempt == 0: time.sleep(2)
+            continue
     return None
 
 def fetch_ruseo():
@@ -416,6 +434,82 @@ def fetch_ruseo():
             return [[None, date_str, digits]]
         return None
     except: return None
+
+def fetch_cwl_html():
+    """cwl.gov.cn HTML页面解析 (API失败时的HTML兜底)
+    从官方开奖页面直接解析数据, 不依赖JSON API
+    """
+    try:
+        url = 'https://www.cwl.gov.cn/ygkj/wqkjgg/ssq/'
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml',
+            'Accept-Language': 'zh-CN,zh;q=0.9',
+        }
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            html = resp.read().decode('utf-8', errors='replace')
+        # 3D数据通常在JSON内嵌或表格中, 尝试查找
+        results = []
+        # 尝试从HTML中提取JSON数据块
+        json_patterns = [r'var\s+drawNotice\s*=\s*(\{.*?\});', r'drawNotice\s*[:=]\s*(\{.*?\})', 
+                        r'data\s*=\s*(\{.*?result.*?\})', r'"result"\s*:\s*(\[.*?\])']
+        for pat in json_patterns:
+            matches = re.findall(pat, html, re.DOTALL)
+            for m in matches:
+                try:
+                    data = json.loads(m)
+                    if isinstance(data, dict) and 'result' in data:
+                        items = data['result']
+                    elif isinstance(data, list):
+                        items = data
+                    else:
+                        continue
+                    for item in items:
+                        if not isinstance(item, dict): continue
+                        if item.get('name') == '3D' and item.get('red'):
+                            digits = [int(c) for c in item['red'].split(',')]
+                            if len(digits) == 3:
+                                results.append([item.get('code',''), item.get('date',''), digits])
+                except: continue
+            if results: break
+        if results:
+            results.sort(key=lambda x: x[0])
+            return results
+    except: pass
+    
+    # 方案2: 尝试手机版页面
+    try:
+        url = 'https://m.cwl.gov.cn/cwl_admin/kjxx/findKjxx/for4987'
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36',
+            'Accept': 'text/html,application/xhtml+xml',
+            'Referer': 'https://m.cwl.gov.cn/',
+        }
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            html = resp.read().decode('utf-8', errors='replace')
+        
+        # 从手机版页面解析
+        for pat in [r'"result":(\[.*?\])', r'result\s*=\s*(\[.*?\])', r'data\s*=\s*(\[.*?\])']:
+            matches = re.findall(pat, html, re.DOTALL)
+            for m in matches:
+                try:
+                    items = json.loads(m)
+                    results = []
+                    for item in items:
+                        if isinstance(item, dict) and item.get('name') == '3D' and item.get('red'):
+                            digits = [int(c) for c in item['red'].split(',')]
+                            if len(digits) == 3:
+                                results.append([item.get('code',''), item.get('date',''), digits])
+                    if results:
+                        results.sort(key=lambda x: x[0])
+                        return results
+                except: continue
+    except: pass
+    
+    return None
+
 
 def fetch_zhcw():
     """中彩网 (官方合作伙伴, 多URL备选)
@@ -583,10 +677,11 @@ def load_data():
         print(f"  [{tag}] {name}: {cnt}期")
         return result
     
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
         futures = {
             executor.submit(_fetch_one, fetch_ruseo, '澄曜'): 'ruseo',
             executor.submit(_fetch_one, fetch_cwl, 'cwl官网'): 'cwl',
+            executor.submit(_fetch_one, fetch_cwl_html, 'cwl-HTML'): 'cwlhtml',
             executor.submit(_fetch_one, fetch_zhcw, '中彩网'): 'zhcw',
             executor.submit(_fetch_one, fetch_aicai, '爱彩网'): 'aicai',
             executor.submit(_fetch_one, fetch_github, 'GitHub', gh_token): 'github',

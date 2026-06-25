@@ -35,9 +35,26 @@ jobs:
             exit 0
           fi
           TODAY=$(TZ='Asia/Shanghai' date +'%Y-%m-%d')
+          # 检查上一次提交是否包含今天日期
           if git log -1 --pretty=format:"%s" | grep -q "$TODAY"; then
+            # 进一步检查: 缓存中是否已经有今天的开奖数据
+            # 如果缓存最新期号对应的日期不是今天, 说明数据没更新, 仍需运行
+            if [ -f docs/fc3d_cache.json ]; then
+              LAST_DATE=$(python3 -c "
+import json
+with open('docs/fc3d_cache.json','r') as f:
+    d=json.load(f)
+# 最后一条是昨天或更早, 需要继续拉取
+print('stale' if d[-1][1] < '$TODAY' else 'fresh')
+" 2>/dev/null || echo 'stale')
+              if [ "$LAST_DATE" = "stale" ]; then
+                echo "skipped=false" >> $GITHUB_OUTPUT
+                echo "数据过期(最新: $LAST_DATE), 重新拉取"
+                exit 0
+              fi
+            fi
             echo "skipped=true" >> $GITHUB_OUTPUT
-            echo "今日已更新, 跳过"
+            echo "今日已更新且数据新鲜, 跳过"
           else
             echo "skipped=false" >> $GITHUB_OUTPUT
           fi
