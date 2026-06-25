@@ -27,6 +27,10 @@ jobs:
         with:
           python-version: '3.11'
       
+      - name: 同步最新代码
+        run: |
+          git pull --rebase origin master 2>/dev/null || git rebase --abort 2>/dev/null || true
+      
       - name: 检查是否需要更新
         id: check
         run: |
@@ -40,13 +44,11 @@ jobs:
           # 检查上一次提交是否包含今天日期
           if git log -1 --pretty=format:"%s" | grep -q "$TODAY"; then
             # 进一步检查: 缓存中是否已经有今天的开奖数据
-            # 如果缓存最新期号对应的日期不是今天, 说明数据没更新, 仍需运行
             if [ -f docs/fc3d_cache.json ]; then
               LAST_DATE=$(python3 -c "
 import json
 with open('docs/fc3d_cache.json','r') as f:
     d=json.load(f)
-# 最后一条是昨天或更早, 需要继续拉取
 print('stale' if d[-1][1] < '$TODAY' else 'fresh')
 " 2>/dev/null || echo 'stale')
               if [ "$LAST_DATE" = "stale" ]; then
@@ -79,12 +81,16 @@ print('stale' if d[-1][1] < '$TODAY' else 'fresh')
             exit 0
           fi
           git commit -m "🤖 自动更新 $(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M')"
-          # 重试3次push, 每次先pull --rebase防冲突
+          # 重试3次push, 每次先rebase到最新
           for i in 1 2 3; do
-            if git pull --rebase origin master 2>/dev/null && git push; then
+            if git pull --rebase origin master && git push; then
               echo "push_ok=true" >> $GITHUB_OUTPUT
               exit 0
             fi
+            # 如果rebase冲突, accept算法生成的文件为权威
+            git checkout --theirs docs/index.html docs/fc3d_cache.json docs/fc3d_embedded.json 2>/dev/null
+            git add docs/index.html docs/fc3d_cache.json docs/fc3d_embedded.json 2>/dev/null
+            git rebase --continue 2>/dev/null || git rebase --abort
             echo "push失败, 第${i}次重试..."
             sleep $(($i * 5))
           done
