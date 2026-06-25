@@ -1,8 +1,6 @@
 name: 每日自动更新两码不组预测 (三重备份)
 
 on:
-  push:
-    branches: [master]
   schedule:
     # 北京时间 22:00 = UTC 14:00
     - cron: '0 14 * * *'
