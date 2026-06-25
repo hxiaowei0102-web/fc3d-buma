@@ -891,7 +891,7 @@ def generate_html(all_data, bt100, algo_data=None):
     top_pairs = sorted(pair_counter.items(), key=lambda x: x[1], reverse=True)[:8]
     hot_html = ''.join(f'<span class="ht">{a}{b}<small>{c}次</small></span>' for (a,b),c in top_pairs)
     
-    update_time = time.strftime('%Y-%m-%d %H:%M', time.localtime())
+    update_time = time.strftime('%Y-%m-%d %H:%M', time.gmtime(time.time() + 8*3600))
     
     return f'''<!DOCTYPE html>
 <html lang="zh-CN">
