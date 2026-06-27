@@ -365,26 +365,52 @@ def fetch_github(token=None):
     except: return None
 
 def fetch_cwl():
-    """cwl.gov.cn (3种方式尝试)"""
-    ua_list = [
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Mobile',
-    ]
-    for ua in ua_list:
-        try:
-            cj = http.cookiejar.CookieJar()
-            opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
-            url = 'https://www.cwl.gov.cn/cwl_admin/front/cwlkj/search/kjxx/findDrawNotice?name=3d&issueCount=80'
-            headers = {
-                'User-Agent': ua,
-                'Referer': 'https://www.cwl.gov.cn/ygkj/wqkjgg/ssq/',
-                'Accept': 'application/json',
-            }
-            req = urllib.request.Request(url, headers=headers)
-            with opener.open(req, timeout=15) as resp:
-                result = _parse_cwl(json.loads(resp.read()))
-            if result: return result
-        except: continue
+    """cwl.gov.cn (多方式, 带重定向处理)"""
+    # 方案1: 标准请求 + 自动处理cookie/重定向
+    try:
+        cj = http.cookiejar.CookieJar()
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+        https_h = urllib.request.HTTPSHandler(context=ctx)
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(cj),
+            https_h,
+            urllib.request.HTTPRedirectHandler()
+        )
+        url = 'https://www.cwl.gov.cn/cwl_admin/front/cwlkj/search/kjxx/findDrawNotice?name=3d&issueCount=80'
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': 'https://www.cwl.gov.cn/ygkj/wqkjgg/ssq/',
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'zh-CN,zh;q=0.9',
+        }
+        req = urllib.request.Request(url, headers=headers)
+        with opener.open(req, timeout=20) as resp:
+            result = _parse_cwl(json.loads(resp.read()))
+        if result: return result
+    except: pass
+    
+    # 方案2: 移动端UA
+    try:
+        cj2 = http.cookiejar.CookieJar()
+        ctx2 = ssl.create_default_context()
+        ctx2.check_hostname = False; ctx2.verify_mode = ssl.CERT_NONE
+        https_h2 = urllib.request.HTTPSHandler(context=ctx2)
+        opener2 = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(cj2), https_h2,
+            urllib.request.HTTPRedirectHandler()
+        )
+        url = 'https://www.cwl.gov.cn/cwl_admin/front/cwlkj/search/kjxx/findDrawNotice?name=3d&issueCount=80'
+        headers2 = {
+            'User-Agent': 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Mobile',
+            'Referer': 'https://m.cwl.gov.cn/',
+            'Accept': 'application/json',
+        }
+        req2 = urllib.request.Request(url, headers=headers2)
+        with opener2.open(req2, timeout=20) as resp:
+            result2 = _parse_cwl(json.loads(resp.read()))
+        if result2: return result2
+    except: pass
     return None
 
 def fetch_ruseo():
@@ -534,6 +560,22 @@ def fetch_aicai():
     
     return None
 
+def fetch_self_github():
+    """v5.3 自引用: 读取本仓库 raw fc3d_cache.json 作为兜底数据源
+    确保即使所有外部源都宕机, 也能从自己上次的缓存中恢复
+    """
+    try:
+        url = 'https://raw.githubusercontent.com/hxiaowei0102-web/fc3d-buma/master/docs/fc3d_cache.json'
+        req = urllib.request.Request(url, headers={'User-Agent': 'fc3d-buma-self/5.3'})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            raw = json.loads(resp.read())
+        results = []
+        for rec in raw:
+            if len(rec) >= 3 and isinstance(rec[2], list) and len(rec[2]) == 3:
+                results.append([str(rec[0]), rec[1] if len(rec) > 1 else '', rec[2]])
+        return results if results else None
+    except: return None
+
 def fetch_cache():
     if os.path.exists(CACHE_FILE):
         try:
@@ -604,23 +646,23 @@ def fetch_cwl_web():
     return None
 
 def load_data():
-    """v5.3 八源并行获取 + 多数投票 + 完整性校验
-    源1: 澄曜API (最新1期)
-    源2: cwl.gov.cn API (最近80期)
+    """v5.3 九源并行获取 + 多数投票 + 完整性校验
+    源1: 灰鸟API huiniao.top (JSON, 7673期, 境外可访问)
+    源2: cwl.gov.cn (官方, 80期, 加固cookie/重定向)
     源3: 中彩网 zhcw.com (100期)
-    源4: 爱彩网 aicai.com (200期)
+    源4: 爱彩网 aicai.com (200期)  
     源5: GitHub FSloper (全量权威校验)
-    源6: cwl网页爬虫 (HTML备用)
-    源7: 灰鸟API huiniao.top (JSON, 7673期, 境外可访问)
-    源8: kjapi.net HTML (境外彩票站)
+    源6: 澄曜API (最新1期)
+    源7: cwl网页爬虫 (HTML备用)
+    源8: kjapi.net (境外彩票站)
+    源9: 自引用 raw cache (兜底, 读自己缓存)
     
     策略:
-    - 8源并行抓取 (ThreadPool)
+    - 9源并行抓取 (ThreadPool)
     - 每个源3次重试+指数退避
-    - 同号多数据冲突时: 3+源一致→采信多数; 2:2平→GitHub/huiniao裁决
-    - 数据完整性自动检测 + 缓存持久化
+    - 同号冲突: GitHub > 灰鸟 > cwl > 多数
     """
-    print("[数据] v5.3 八源并行获取...")
+    print("[数据] v5.3 九源并行获取...")
     gh_token = os.environ.get('GITHUB_TOKEN', None)
     
     # ============ Phase 1: 并行抓取所有源 ============
@@ -636,16 +678,17 @@ def load_data():
         print(f"  [{tag}] {name}: {cnt}期")
         return result
     
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=9) as executor:
         futures = {
             executor.submit(_fetch_one, fetch_huiniao, '灰鸟API'): 'huiniao',
-            executor.submit(_fetch_one, fetch_kjapi, 'kjapi'): 'kjapi',
-            executor.submit(_fetch_one, fetch_ruseo, '澄曜'): 'ruseo',
             executor.submit(_fetch_one, fetch_cwl, 'cwl官网'): 'cwl',
             executor.submit(_fetch_one, fetch_zhcw, '中彩网'): 'zhcw',
             executor.submit(_fetch_one, fetch_aicai, '爱彩网'): 'aicai',
             executor.submit(_fetch_one, fetch_github, 'GitHub', gh_token): 'github',
+            executor.submit(_fetch_one, fetch_ruseo, '澄曜'): 'ruseo',
             executor.submit(_fetch_one, fetch_cwl_web, 'cwl网页'): 'cwl_web',
+            executor.submit(_fetch_one, fetch_kjapi, 'kjapi'): 'kjapi',
+            executor.submit(_fetch_one, fetch_self_github, '自引用缓存'): 'self_gh',
         }
         for f in concurrent.futures.as_completed(futures):
             src_name = futures[f]
@@ -656,7 +699,7 @@ def load_data():
     
     online_count = sum(1 for v in src_ok.values() if v)
     online_names = [k for k, v in src_ok.items() if v]
-    print(f"  >> 在线源: {online_count}/8 ({', '.join(online_names)})")
+    print(f"  >> 在线源: {online_count}/9 ({', '.join(online_names)})")
     
     # ============ Phase 2: 加载本地数据(嵌入+缓存) ============
     data = list(EMBEDDED)
@@ -929,7 +972,7 @@ td{{padding:8px 3px;text-align:center;border-bottom:1px solid #f1f5f9}}
       <div class="pair-box">{next_picks[0][0]}{next_picks[0][1]}</div>
       <div class="pair-box">{next_picks[1][0]}{next_picks[1][1]}</div>
     </div>
-    <div class="footnote">{len(all_data)}期历史 · 灰鸟+kjapi+澄曜+cwl+中彩网+爱彩网+GitHub · 八源并行</div>
+    <div class="footnote">{len(all_data)}期历史 · 灰鸟+cwl+中彩网+爱彩网+GitHub+自引用 · 九源并行</div>
   </div>
 
   <div class="stats">
@@ -959,7 +1002,7 @@ td{{padding:8px 3px;text-align:center;border-bottom:1px solid #f1f5f9}}
   <div class="section">
     <div class="title">🔒 诚实声明</div>
     <div class="info">
-    ✅ 八源并行+重试+投票, 零未来数据泄露<br>
+    ✅ 九源并行+重试+投票, 零未来数据泄露<br>
     ✅ 严格滚动回测, 零未来数据泄露<br>
     ✅ 五源降级: 澄曜+cwl+中彩网+爱彩网+GitHub<br>
     ⚠ 回测100%不代表未来100%，彩票本质随机<br>
