@@ -3,6 +3,7 @@
 """
 福彩3D两码不组 — 云端自动部署版
 GitHub Actions 每日常规运行, 零人工干预
+v5.4: 借鉴五胆码 stable方案 — requests+cloudscraper 突破反爬
 """
 import os, math, json, time, random, re
 from collections import Counter
@@ -12,6 +13,19 @@ import http.cookiejar
 import base64
 import threading
 import concurrent.futures
+import ssl
+
+# requests + cloudscraper (借鉴五胆码稳定方案, 突破反爬)
+try:
+    import requests as _requests
+    HAS_REQUESTS = True
+except ImportError:
+    HAS_REQUESTS = False
+try:
+    import cloudscraper
+    HAS_SCRAPER = True
+except ImportError:
+    HAS_SCRAPER = False
 
 ALL_PAIRS = [(a, b) for a in range(10) for b in range(a + 1, 10)]
 CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fc3d_cache.json')
@@ -291,7 +305,7 @@ def run_backtest(all_data, n=100):
     }
 
 # ============================================================
-# 多源数据获取 v5.3 — 八源并行+重试+投票
+# 多源数据获取 v5.4 — 十一源并行+requests+cloudscraper
 # ============================================================
 
 RETRY_MAX = 3
@@ -560,6 +574,41 @@ def fetch_aicai():
     
     return None
 
+def fetch_cwl_requests():
+    """v5.4 cwl.gov.cn — requests库直连 (借鉴五胆码, 比urllib更稳定)
+    requests自动处理cookies/重定向/编码, 绕过大部分反爬
+    """
+    if not HAS_REQUESTS: return None
+    try:
+        url = "https://www.cwl.gov.cn/cwl_admin/front/cwlkj/search/kjxx/findDrawNotice?name=3d&issueCount=80"
+        r = _requests.get(url, headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': 'https://www.cwl.gov.cn/',
+            'Accept': 'application/json',
+        }, timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            if data.get('result'):
+                return _parse_cwl(data)
+    except: pass
+    return None
+
+def fetch_cwl_scraper():
+    """v5.4 cloudscraper — 绕过Cloudflare防护 (借鉴五胆码)
+    cloudscraper模拟浏览器TLS指纹, 突破WAF
+    """
+    if not HAS_SCRAPER: return None
+    try:
+        scraper = cloudscraper.create_scraper()
+        url = "https://www.cwl.gov.cn/cwl_admin/front/cwlkj/search/kjxx/findDrawNotice?name=3d&issueCount=80"
+        r = scraper.get(url, timeout=20)
+        if r.status_code == 200:
+            data = r.json()
+            if data.get('result'):
+                return _parse_cwl(data)
+    except: pass
+    return None
+
 def fetch_self_github():
     """v5.3 自引用: 读取本仓库 raw fc3d_cache.json 作为兜底数据源
     确保即使所有外部源都宕机, 也能从自己上次的缓存中恢复
@@ -646,23 +695,22 @@ def fetch_cwl_web():
     return None
 
 def load_data():
-    """v5.3 九源并行获取 + 多数投票 + 完整性校验
+    """v5.4 十一源并行获取 + 多数投票 + 完整性校验
     源1: 灰鸟API huiniao.top (JSON, 7673期, 境外可访问)
-    源2: cwl.gov.cn (官方, 80期, 加固cookie/重定向)
-    源3: 中彩网 zhcw.com (100期)
-    源4: 爱彩网 aicai.com (200期)  
-    源5: GitHub FSloper (全量权威校验)
-    源6: 澄曜API (最新1期)
-    源7: cwl网页爬虫 (HTML备用)
-    源8: kjapi.net (境外彩票站)
-    源9: 自引用 raw cache (兜底, 读自己缓存)
+    源2: cwl.gov.cn urllib (加固SSL+重定向)
+    源3: cwl.gov.cn requests (借鉴五胆码, 更稳定)
+    源4: cwl.gov.cn cloudscraper (突破Cloudflare WAF)
+    源5: 中彩网 zhcw.com
+    源6: 爱彩网 aicai.com
+    源7: GitHub FSloper (全量权威校验)
+    源8: 澄曜API
+    源9: cwl网页爬虫
+    源10: kjapi.net
+    源11: 自引用 raw cache (兜底)
     
-    策略:
-    - 9源并行抓取 (ThreadPool)
-    - 每个源3次重试+指数退避
-    - 同号冲突: GitHub > 灰鸟 > cwl > 多数
+    借鉴五胆码: pip install requests cloudscraper → 3路cwl突破反爬
     """
-    print("[数据] v5.3 九源并行获取...")
+    print("[数据] v5.4 十一源并行获取 (借鉴五胆码)...")
     gh_token = os.environ.get('GITHUB_TOKEN', None)
     
     # ============ Phase 1: 并行抓取所有源 ============
@@ -678,10 +726,12 @@ def load_data():
         print(f"  [{tag}] {name}: {cnt}期")
         return result
     
-    with concurrent.futures.ThreadPoolExecutor(max_workers=9) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=11) as executor:
         futures = {
             executor.submit(_fetch_one, fetch_huiniao, '灰鸟API'): 'huiniao',
-            executor.submit(_fetch_one, fetch_cwl, 'cwl官网'): 'cwl',
+            executor.submit(_fetch_one, fetch_cwl, 'cwl_url'): 'cwl',
+            executor.submit(_fetch_one, fetch_cwl_requests, 'cwl_req'): 'cwl_req',
+            executor.submit(_fetch_one, fetch_cwl_scraper, 'cwl_cs'): 'cwl_cs',
             executor.submit(_fetch_one, fetch_zhcw, '中彩网'): 'zhcw',
             executor.submit(_fetch_one, fetch_aicai, '爱彩网'): 'aicai',
             executor.submit(_fetch_one, fetch_github, 'GitHub', gh_token): 'github',
@@ -699,7 +749,7 @@ def load_data():
     
     online_count = sum(1 for v in src_ok.values() if v)
     online_names = [k for k, v in src_ok.items() if v]
-    print(f"  >> 在线源: {online_count}/9 ({', '.join(online_names)})")
+    print(f"  >> 在线源: {online_count}/11 ({', '.join(online_names)})")
     
     # ============ Phase 2: 加载本地数据(嵌入+缓存) ============
     data = list(EMBEDDED)
@@ -958,7 +1008,7 @@ td{{padding:8px 3px;text-align:center;border-bottom:1px solid #f1f5f9}}
 <body>
 <div class="header">
   <h1>晓炜两码不组</h1>
-  <div class="sub">v5.3 · 八源并行 · 云端全自动</div>
+  <div class="sub">v5.4 · 十一源并行 · requests+cloudscraper · 稳定</div>
 </div>
 
 <div class="container">
@@ -972,7 +1022,7 @@ td{{padding:8px 3px;text-align:center;border-bottom:1px solid #f1f5f9}}
       <div class="pair-box">{next_picks[0][0]}{next_picks[0][1]}</div>
       <div class="pair-box">{next_picks[1][0]}{next_picks[1][1]}</div>
     </div>
-    <div class="footnote">{len(all_data)}期历史 · 灰鸟+cwl+中彩网+爱彩网+GitHub+自引用 · 九源并行</div>
+    <div class="footnote">{len(all_data)}期历史 · 灰鸟+requests+cloudscraper+cwl+中彩网+爱彩网+GitHub · 十一源并行</div>
   </div>
 
   <div class="stats">
@@ -1002,7 +1052,7 @@ td{{padding:8px 3px;text-align:center;border-bottom:1px solid #f1f5f9}}
   <div class="section">
     <div class="title">🔒 诚实声明</div>
     <div class="info">
-    ✅ 九源并行+重试+投票, 零未来数据泄露<br>
+    ✅ 十一源并行+requests+cloudscraper, 零未来数据泄露<br>
     ✅ 严格滚动回测, 零未来数据泄露<br>
     ✅ 五源降级: 澄曜+cwl+中彩网+爱彩网+GitHub<br>
     ⚠ 回测100%不代表未来100%，彩票本质随机<br>
