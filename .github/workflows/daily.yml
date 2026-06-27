@@ -1,0 +1,51 @@
+name: 两码不组每日自动更新
+
+on:
+  schedule:
+    - cron: '0 14 * * *'    # UTC 14:00 = 北京 22:00 (主)
+    - cron: '30 15 * * *'   # UTC 15:30 = 北京 23:30 (备1)
+    - cron: '0 17 * * *'    # UTC 17:00 = 北京 01:00 (备2)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  update-and-deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: pip install requests cloudscraper
+
+      - name: Run prediction
+        run: cd docs && python fc3d_buma.py
+
+      - name: Sync root index
+        run: cp docs/index.html index.html
+
+      - name: Commit state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/index.html docs/fc3d_cache.json docs/fc3d_embedded.json index.html
+          git diff --staged --quiet || (git commit -m "auto $(TZ='Asia/Shanghai' date +%Y-%m-%d_%H:%M)" && git push)
+
+      - uses: actions/configure-pages@v4
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: '.'
+
+      - uses: actions/deploy-pages@v4
+        id: deployment
